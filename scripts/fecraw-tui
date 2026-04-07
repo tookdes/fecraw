@@ -1,0 +1,130 @@
+#!/bin/bash
+# fecraw-tui: Interactive TUI configuration for fecraw
+# Uses dialog/whiptail for UI
+
+CONFIG_DIR="/etc/fecraw"
+CONFIG_FILE="$CONFIG_DIR/fecraw.toml"
+
+# Detect dialog or whiptail
+if command -v dialog &>/dev/null; then
+    DIALOG=dialog
+elif command -v whiptail &>/dev/null; then
+    DIALOG=whiptail
+else
+    echo "Error: neither 'dialog' nor 'whiptail' is installed."
+    echo "Install with: apt install dialog"
+    exit 1
+fi
+
+TITLE="fecraw Configuration"
+
+ask() {
+    $DIALOG --title "$TITLE" --inputbox "$1" 10 60 "$2" 3>&1 1>&2 2>&3
+}
+
+menu() {
+    $DIALOG --title "$TITLE" --menu "$1" 15 60 "$2" "${@:3}" 3>&1 1>&2 2>&3
+}
+
+yesno() {
+    $DIALOG --title "$TITLE" --yesno "$1" 8 60
+    return $?
+}
+
+msgbox() {
+    $DIALOG --title "$TITLE" --msgbox "$1" 10 60
+}
+
+# Mode selection
+MODE=$(menu "Select operating mode:" 2 \
+    "server" "Run as server (on VPS)" \
+    "client" "Run as client (local machine)")
+[ $? -ne 0 ] && exit 0
+
+# Key
+KEY=$(ask "Encryption password (same on both sides):" "change_me")
+[ $? -ne 0 ] && exit 0
+
+# Network
+if [ "$MODE" = "server" ]; then
+    LISTEN=$(ask "Server listen address:" "0.0.0.0:4096")
+    [ $? -ne 0 ] && exit 0
+    REMOTE=""
+else
+    LISTEN=$(ask "Local listen address:" "0.0.0.0:3333")
+    [ $? -ne 0 ] && exit 0
+    REMOTE=$(ask "Remote server address:" "YOUR_SERVER_IP:4096")
+    [ $? -ne 0 ] && exit 0
+fi
+
+# Raw mode
+RAW_MODE=$(menu "TCP disguise mode:" 3 \
+    "faketcp" "Fake TCP (recommended)" \
+    "udp"     "Raw UDP" \
+    "icmp"    "ICMP tunnel")
+[ $? -ne 0 ] && exit 0
+
+# Cipher
+CIPHER=$(menu "Encryption algorithm:" 4 \
+    "aes128cbc" "AES-128-CBC (default, recommended)" \
+    "aes128cfb" "AES-128-CFB" \
+    "xor"       "XOR (fast, weak)" \
+    "none"      "No encryption")
+[ $? -ne 0 ] && exit 0
+
+# Auth
+AUTH=$(menu "Authentication mode:" 5 \
+    "hmac_sha1" "HMAC-SHA1 (default, recommended)" \
+    "md5"       "MD5" \
+    "crc32"     "CRC32 (fast, weak)" \
+    "simple"    "Simple" \
+    "none"      "No authentication")
+[ $? -ne 0 ] && exit 0
+
+# VPN
+SUBNET=$(ask "VPN subnet:" "10.22.22.0")
+[ $? -ne 0 ] && exit 0
+
+TUN_MTU=$(ask "TUN MTU:" "1380")
+[ $? -ne 0 ] && exit 0
+
+# FEC
+FEC_RATIO=$(ask "FEC ratio (data:redundant):" "20:10")
+[ $? -ne 0 ] && exit 0
+
+FEC_TIMEOUT=$(ask "FEC timeout (ms):" "8")
+[ $? -ne 0 ] && exit 0
+
+# Generate config
+mkdir -p "$CONFIG_DIR"
+cat > "$CONFIG_FILE" << TOMLEOF
+[general]
+mode = "$MODE"
+key = "$KEY"
+
+[network]
+listen = "$LISTEN"
+$([ -n "$REMOTE" ] && echo "remote = \"$REMOTE\"")
+raw_mode = "$RAW_MODE"
+cipher = "$CIPHER"
+auth = "$AUTH"
+
+[vpn]
+subnet = "$SUBNET"
+tun_dev = ""
+tun_mtu = $TUN_MTU
+
+[fec]
+mode = 0
+fec = "$FEC_RATIO"
+timeout = $FEC_TIMEOUT
+mtu = 1250
+
+[advanced]
+seq_mode = 3
+auto_iptables = true
+keep_reconnect = true
+log_level = 4
+TOMLEOF
+
+msgbox "Configuration saved to $CONFIG_FILE\n\nStart with:\n  systemctl start fecraw\n\nOr run directly:\n  fecraw --config $CONFIG_FILE"
