@@ -22,7 +22,7 @@ extern "C" {
 struct raw_api_config_t {
     int is_server;             /* 1=server, 0=client */
     int raw_mode;              /* 0=faketcp, 1=udp, 2=icmp */
-    int cipher_mode;           /* 0=aes128cfb, 1=aes128cbc, 2=xor, 3=none */
+    int cipher_mode;           /* 0=aes128cfb, 1=aes128cbc, 2=xor, 3=none, 4=aes256gcm, 5=chacha20poly1305 */
     int auth_mode;             /* 0=hmac_sha1, 1=md5, 2=crc32, 3=simple, 4=none */
     int seq_mode;              /* 0..4 */
     int auto_iptables;         /* auto add iptables rule */

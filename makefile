@@ -1,8 +1,8 @@
 CC = g++
 
-UDPRAW_DIR = ../udp2raw
-TINYFEC_DIR = ../tinyfecVPN
-UDPSPEEDER_DIR = ../UDPspeeder
+UDPRAW_DIR = ref/udp2raw
+TINYFEC_DIR = ref/tinyfecVPN
+UDPSPEEDER_DIR = ref/UDPspeeder
 FEC_LIBEV_DIR = $(UDPSPEEDER_DIR)/libev
 RAW_LIBEV_DIR = $(UDPRAW_DIR)/libev
 
@@ -10,7 +10,7 @@ CFLAGS_COMMON = -std=c++11 -O2 -Wall -DUDP2RAW_LINUX
 
 CFLAGS_FEC = $(CFLAGS_COMMON) -I$(UDPSPEEDER_DIR) -I$(FEC_LIBEV_DIR) -I$(TINYFEC_DIR) -I.
 
-CFLAGS_RAW = $(CFLAGS_COMMON) -fPIC -fvisibility=hidden \
+CFLAGS_RAW = $(CFLAGS_COMMON) -fPIC -fvisibility=hidden -DFECRAW_USE_OPENSSL \
 	-I$(UDPRAW_DIR) -I$(RAW_LIBEV_DIR) -I$(UDPRAW_DIR)/lib -I.
 
 CFLAGS_RAW_API = $(CFLAGS_RAW) -DRAW_API_BUILDING_SO
@@ -72,7 +72,7 @@ git_version_headers:
 
 # ---- Shared library: complete symbol isolation via .so boundary ----
 $(RAW_SO): $(RAW_OBJS)
-	$(CC) -shared -Wl,-Bsymbolic -o $@ $^ -lpthread -lrt
+	$(CC) -shared -Wl,-Bsymbolic -o $@ $^ -lpthread -lrt -lssl -lcrypto
 	@echo "Built shared library: $@"
 
 # ---- Final executable ----

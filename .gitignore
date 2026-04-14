@@ -1,0 +1,6 @@
+ref/
+build/
+fecraw
+*.tar.gz
+*.o
+*.so

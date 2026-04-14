@@ -19,12 +19,39 @@
 #include "delay_manager.h"
 
 #include "fecraw_config.h"
+#include "packet.h"
 #include "raw_api.h"
 
 #include <getopt.h>
 #include <signal.h>
 
-static fecraw_config_t g_cfg;
+#ifdef __x86_64__
+#include <cpuid.h>
+static int detect_aesni() {
+    unsigned int eax, ebx, ecx, edx;
+    __cpuid(1, eax, ebx, ecx, edx);
+    return (ecx >> 25) & 1;
+}
+#elif defined(__aarch64__)
+static int detect_aesni() { return 1; }
+#else
+static int detect_aesni() { return 0; }
+#endif
+
+static int resolve_auto_cipher(int cipher_mode) {
+    if (cipher_mode != 6) return cipher_mode;
+    return detect_aesni() ? 4 : 5; // aes256gcm : chacha20poly1305
+}
+
+static const char *cipher_mode_name(int m) {
+    static const char *names[] = {
+        "aes128cfb", "aes128cbc", "xor", "none",
+        "aes256gcm", "chacha20poly1305", "auto"
+    };
+    return (m >= 0 && m <= 6) ? names[m] : "unknown";
+}
+
+fecraw_config_t g_cfg;
 
 static void print_usage() {
     printf("fecraw - Unified FEC VPN + TCP Disguise Tool\n");
@@ -44,8 +71,8 @@ static void print_usage() {
     printf("  --remote <ip:port>        Remote server address\n");
     printf("  --key <string>            Encryption key\n");
     printf("  --raw-mode <mode>         faketcp(default), udp, icmp\n");
-    printf("  --cipher <mode>           aes128cbc(default), aes128cfb, xor, none\n");
-    printf("  --auth <mode>             hmac_sha1(default), md5, crc32, simple, none\n");
+    printf("  --cipher <mode>           aes256gcm(default), aes128cbc, aes128cfb, xor, none, chacha20poly1305, auto\n");
+    printf("  --auth <mode>             hmac_sha1, md5, crc32, simple, none (auto-none for AEAD)\n");
     printf("  --subnet <ip>             VPN subnet, default: 10.22.22.0\n");
     printf("  --tun-dev <name>          TUN device name\n");
     printf("  --tun-mtu <n>             TUN MTU, default: 1380\n");
@@ -54,6 +81,10 @@ static void print_usage() {
     printf("  --seq-mode <n>            TCP seq mode 0-4, default: 3\n");
     printf("  --auto-rule               Auto add iptables rules\n");
     printf("  --log-level <n>           0=never .. 5=debug\n");
+    printf("  --adaptive-fec            Enable adaptive FEC ratio\n");
+    printf("  --small-pkt <n>           Small packet threshold (bytes), 0=off\n");
+    printf("  --enable-pacing           Enable BBR-lite traffic shaping\n");
+    printf("  --max-bandwidth <n>       Pacing bandwidth cap (bytes/s), 0=unlimited\n");
     printf("  -h, --help                Print this help\n");
 }
 
@@ -83,10 +114,36 @@ static void apply_fec_globals(fecraw_config_t &cfg) {
     mssfix = cfg.mssfix;
     disable_fec = cfg.disable_fec;
 
+    {
+        char fec_buf[64];
+        strncpy(fec_buf, cfg.fec_str, sizeof(fec_buf) - 1);
+        fec_buf[sizeof(fec_buf) - 1] = '\0';
+        if (g_fec_par.rs_from_str(fec_buf) != 0) {
+            if (!disable_fec) {
+                mylog(log_fatal, "invalid FEC parameter: %s\n", cfg.fec_str);
+                myexit(-1);
+            }
+            char fallback[] = "1:0";
+            g_fec_par.rs_from_str(fallback);
+        }
+        g_fec_par.timeout = cfg.fec_timeout * 1000;
+        g_fec_par.mtu = cfg.fec_mtu;
+        g_fec_par.mode = cfg.fec_mode;
+    }
+
+    if (strlen(cfg.key) > 0) {
+        strncpy(key_string, cfg.key, sizeof(key_string) - 1);
+        key_string[sizeof(key_string) - 1] = '\0';
+    }
+
     delay_manager.set_capacity(delay_capacity);
 }
 
-static void fill_raw_config(const fecraw_config_t &cfg, raw_api_config_t &rcfg) {
+static void fill_raw_config(fecraw_config_t &cfg, raw_api_config_t &rcfg) {
+    cfg.cipher_mode = resolve_auto_cipher(cfg.cipher_mode);
+    if (cfg.cipher_mode == 4 || cfg.cipher_mode == 5)
+        cfg.auth_mode = 4; // none
+
     memset(&rcfg, 0, sizeof(rcfg));
     rcfg.is_server = cfg.is_server;
     rcfg.raw_mode = cfg.raw_mode;
@@ -135,6 +192,10 @@ static int parse_cli(int argc, char *argv[], fecraw_config_t &cfg) {
         {"keep-reconnect",    no_argument,       0, 10},
         {"log-level",         required_argument, 0, 11},
         {"disable-fec",       no_argument,       0, 12},
+        {"adaptive-fec",      no_argument,       0, 13},
+        {"small-pkt",         required_argument, 0, 14},
+        {"enable-pacing",     no_argument,       0, 15},
+        {"max-bandwidth",     required_argument, 0, 16},
         {"help",              no_argument,       0, 'h'},
         {NULL, 0, 0, 0}
     };
@@ -190,6 +251,9 @@ static int parse_cli(int argc, char *argv[], fecraw_config_t &cfg) {
                 else if (strcmp(optarg, "aes128cbc") == 0) cfg.cipher_mode = 1;
                 else if (strcmp(optarg, "xor") == 0) cfg.cipher_mode = 2;
                 else if (strcmp(optarg, "none") == 0) cfg.cipher_mode = 3;
+                else if (strcmp(optarg, "aes256gcm") == 0) cfg.cipher_mode = 4;
+                else if (strcmp(optarg, "chacha20poly1305") == 0) cfg.cipher_mode = 5;
+                else if (strcmp(optarg, "auto") == 0) cfg.cipher_mode = 6;
                 break;
             case 3:
                 if (strcmp(optarg, "hmac_sha1") == 0) cfg.auth_mode = 0;
@@ -206,6 +270,10 @@ static int parse_cli(int argc, char *argv[], fecraw_config_t &cfg) {
             case 10: cfg.keep_reconnect = 1; break;
             case 11: cfg.log_level = atoi(optarg); break;
             case 12: cfg.disable_fec = 1; break;
+            case 13: cfg.fec_adaptive = 1; break;
+            case 14: cfg.small_packet_threshold = atoi(optarg); break;
+            case 15: cfg.enable_pacing = 1; break;
+            case 16: cfg.max_bandwidth = atoll(optarg); break;
             case 'h': print_usage(); exit(0);
             default: print_usage(); exit(1);
         }
@@ -280,8 +348,10 @@ int main(int argc, char *argv[]) {
     }
 
     mylog(log_info, "fecraw starting in %s mode\n", g_cfg.is_server ? "server" : "client");
-    mylog(log_info, "raw_mode=%s fec=%s\n",
-          raw_api_mode_name(g_cfg.raw_mode), g_cfg.fec_str);
+    mylog(log_info, "raw_mode=%s cipher=%s fec=%s adaptive=%d pacing=%d small_pkt=%d\n",
+          raw_api_mode_name(g_cfg.raw_mode), cipher_mode_name(g_cfg.cipher_mode),
+          g_cfg.fec_str, g_cfg.fec_adaptive, g_cfg.enable_pacing,
+          g_cfg.small_packet_threshold);
 
     sub_net_uint32 = inet_addr(sub_net);
 
