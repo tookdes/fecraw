@@ -8,18 +8,19 @@ on:
     branches: [master, main]
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            arch: x86_64
-          - os: ubuntu-24.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.os }}
-
+  build-x86_64:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone dependencies
+        run: |
+          git clone https://github.com/wangyu-/udp2raw ref/udp2raw
+          git -C ref/udp2raw checkout 4208db6e27c46f3ccec8b98722af7ec23bc62e73
+          git clone https://github.com/wangyu-/UDPspeeder ref/UDPspeeder
+          git -C ref/UDPspeeder checkout 038e47cd6ecd61d4cd9b2a6970ca263388cf00b8
+          git clone https://github.com/wangyu-/tinyfecVPN ref/tinyfecVPN
+          git -C ref/tinyfecVPN checkout cbdf9beed3d03558b70d54e712453293f1d824f0
 
       - name: Install dependencies
         run: |
@@ -32,29 +33,64 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: fecraw-${{ matrix.arch }}
+          name: fecraw-x86_64
+          path: |
+            fecraw
+            build/libudp2raw_raw.so
+
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build in ARM64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$(pwd):/workspace" -w /workspace \
+            ubuntu:24.04 bash -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y g++ libssl-dev make git
+              git clone https://github.com/wangyu-/udp2raw ref/udp2raw
+              git -C ref/udp2raw checkout 4208db6e27c46f3ccec8b98722af7ec23bc62e73
+              git clone https://github.com/wangyu-/UDPspeeder ref/UDPspeeder
+              git -C ref/UDPspeeder checkout 038e47cd6ecd61d4cd9b2a6970ca263388cf00b8
+              git clone https://github.com/wangyu-/tinyfecVPN ref/tinyfecVPN
+              git -C ref/tinyfecVPN checkout cbdf9beed3d03558b70d54e712453293f1d824f0
+              make
+            '
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fecraw-arm64
           path: |
             fecraw
             build/libudp2raw_raw.so
 
   release:
-    needs: build
+    needs: [build-x86_64, build-arm64]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: false
 
       - name: Package
         run: |
           mkdir -p release
           for d in artifacts/fecraw-*; do
             arch=$(basename "$d" | sed 's/fecraw-//')
-            cp "$d/fecraw" "$d/libudp2raw_raw.so" release/
-            tar -czf "release/fecraw-${arch}.tar.gz" -C release fecraw libudp2raw_raw.so
-            rm release/fecraw release/libudp2raw_raw.so
+            mkdir -p "release/$arch"
+            cp "$d/fecraw" "$d/libudp2raw_raw.so" "release/$arch/"
+            tar -czf "release/fecraw-${arch}.tar.gz" -C "release/$arch" .
           done
 
       - name: Upload release assets
