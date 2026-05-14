@@ -1,0 +1,288 @@
+package nrup
+
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"crypto/cipher"
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// nDTLS 最小DTLS实现
+// 只实现记录层格式（标准DTLS记录层格式）
+// 内部用AES-256-GCM加密
+//
+// DTLS 1.2 Record Layer:
+// [1B ContentType][2B Version=0xFEFD][2B Epoch][6B SeqNum][2B Length][Payload]
+
+const (
+	dtlsVersion     = 0xFEFD // DTLS 1.2
+	contentAppData   = 23     // application_data
+	contentHandshake = 22     // handshake
+	recordHeaderLen  = 13     // DTLS record header
+)
+
+// NDTLSConn 最小DTLS连接
+type NDTLSConn struct {
+	udpConn    net.PacketConn
+	remoteAddr net.Addr
+	aead       cipher.AEAD
+	disgui    string // "anyconnect" / "quic"
+	
+	writeEpoch uint16
+	writeSeq   atomic.Uint64
+	readSeq    uint64
+
+	fec        *FECCodec
+	cc         *CongestionController
+	seq        *SeqTracker
+	adaptive   *AdaptiveFEC
+	retransmit *RetransmitQueue
+	closed     atomic.Bool
+	writeMu    sync.Mutex
+	replay     replayWindow
+}
+
+// NewNDTLS 创建最小DTLS连接
+func NewNDTLS(conn net.PacketConn, remoteAddr net.Addr, key []byte, cfg *Config) (*NDTLSConn, error) {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+
+	aead, err := newAEAD(key, cfg.Cipher)
+	if err != nil {
+		return nil, err
+	}
+
+	mc := &NDTLSConn{
+		udpConn:    conn,
+		remoteAddr: remoteAddr,
+		aead:       aead,
+		disgui:    cfg.Disguise,
+		writeEpoch: 1,
+		fec:        NewFECCodec(cfg.FECData, cfg.FECParity),
+		cc:         NewCongestionController(cfg.MaxBandwidthMbps * 1000000 / 8),
+		seq:        NewSeqTracker(),
+		adaptive:   NewAdaptiveFEC(cfg.FECData, cfg.FECParity),
+		retransmit: NewRetransmitQueue(),
+	}
+	return mc, nil
+}
+
+// Write 发送数据（DTLS记录格式 + AES-GCM加密）
+func (mc *NDTLSConn) Write(p []byte) (int, error) {
+	mc.writeMu.Lock()
+	defer mc.writeMu.Unlock()
+
+	nonceSize := mc.aead.NonceSize()
+	overhead := mc.aead.Overhead()
+	payloadLen := nonceSize + len(p) + overhead
+
+	// 无伪装模式：跳过DTLS record header
+	if mc.disgui == "none" {
+		buf := make([]byte, payloadLen)
+		nonce := buf[:nonceSize]
+		if nonceSize > 0 {
+			io.ReadFull(rand.Reader, nonce)
+		}
+		mc.aead.Seal(buf[nonceSize:nonceSize], nonce, p, nil)
+		mc.writeSeq.Add(1)
+		_, err := mc.udpConn.WriteTo(buf, mc.remoteAddr)
+		if err != nil { return 0, err }
+		return len(p), nil
+	}
+
+	totalLen := recordHeaderLen + payloadLen
+
+	// 单次分配：record header + nonce + ciphertext
+	buf := make([]byte, totalLen)
+
+	// nonce
+	nonce := buf[recordHeaderLen : recordHeaderLen+nonceSize]
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil { return 0, err }
+
+	// 加密（直接写入buf）
+	mc.aead.Seal(buf[recordHeaderLen+nonceSize:recordHeaderLen+nonceSize], nonce, p, nil)
+
+	seqNum := mc.writeSeq.Add(1)
+	if mc.disgui == "quic" {
+		// QUIC Short Header: [0x41][8B connID][2B pktNum][payload]
+		// 无length字段（真QUIC靠UDP包边界定长）
+		buf[0] = 0x41 // Fixed bit + 2-byte PN
+		buf[1] = byte(mc.writeEpoch >> 8)
+		buf[2] = byte(mc.writeEpoch)
+		buf[3] = byte(seqNum >> 40)
+		buf[4] = byte(seqNum >> 32)
+		buf[5] = byte(seqNum >> 24)
+		buf[6] = byte(seqNum >> 16)
+		buf[7] = byte(seqNum >> 8)
+		buf[8] = byte(seqNum)
+		buf[9] = byte(seqNum >> 8)
+		buf[10] = byte(seqNum)
+		// payload直接从buf[11]开始（无length字段）
+		// 但为内部兼容保留2B空间（Read通过n-headerLen算长度）
+		binary.BigEndian.PutUint16(buf[11:13], uint16(payloadLen))
+	} else {
+		// DTLS记录头
+		buf[0] = contentAppData
+		binary.BigEndian.PutUint16(buf[1:3], dtlsVersion)
+		binary.BigEndian.PutUint16(buf[3:5], mc.writeEpoch)
+		buf[5] = byte(seqNum >> 40)
+		buf[6] = byte(seqNum >> 32)
+		buf[7] = byte(seqNum >> 24)
+		buf[8] = byte(seqNum >> 16)
+		buf[9] = byte(seqNum >> 8)
+		buf[10] = byte(seqNum)
+		binary.BigEndian.PutUint16(buf[11:13], uint16(payloadLen))
+	}
+
+	mc.cc.Wait(totalLen)
+
+	_, err := mc.udpConn.WriteTo(buf, mc.remoteAddr)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Read 接收数据（解析DTLS记录 + AES-GCM解密）
+func (mc *NDTLSConn) Read(p []byte) (int, error) {
+	buf := make([]byte, 65536)
+	n, _, err := mc.udpConn.ReadFrom(buf)
+	if err != nil {
+		return 0, err
+	}
+
+	// 无伪装模式：直接解密，无record header
+	if mc.disgui == "none" {
+		nonceSize := mc.aead.NonceSize()
+		if n < nonceSize {
+			return 0, errors.New("packet too short")
+		}
+		nonce := buf[:nonceSize]
+		ciphertext := buf[nonceSize:n]
+		plaintext, err := mc.aead.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			return 0, err
+		}
+		copy(p, plaintext)
+		return len(plaintext), nil
+	}
+
+	if n < recordHeaderLen {
+		return 0, errors.New("record too short")
+	}
+
+	// 解析记录头（自动检测DTLS/QUIC格式）
+	var recvSeq uint64
+	var payloadLen uint16
+	if buf[0]&0x80 == 0 && buf[0]&0x40 != 0 {
+		// QUIC Short Header（无length字段，用UDP包长度算）
+		recvSeq = uint64(buf[3])<<40 | uint64(buf[4])<<32 | uint64(buf[5])<<24 |
+			uint64(buf[6])<<16 | uint64(buf[7])<<8 | uint64(buf[8])
+		payloadLen = uint16(n - recordHeaderLen)
+	} else {
+		// DTLS记录头
+		contentType := buf[0]
+		version := binary.BigEndian.Uint16(buf[1:3])
+		if contentType != contentAppData || version != dtlsVersion {
+			return 0, errors.New("invalid record")
+		}
+		recvSeq = uint64(buf[5])<<40 | uint64(buf[6])<<32 | uint64(buf[7])<<24 |
+			uint64(buf[8])<<16 | uint64(buf[9])<<8 | uint64(buf[10])
+		payloadLen = binary.BigEndian.Uint16(buf[11:13])
+	}
+
+	// 防重放检查
+	if !mc.replay.Check(recvSeq) {
+		return 0, errors.New("replay detected")
+	}
+
+	if int(payloadLen)+recordHeaderLen > n {
+		return 0, errors.New("truncated record")
+	}
+
+	payload := buf[recordHeaderLen : recordHeaderLen+int(payloadLen)]
+
+	// AES-GCM解密
+	if len(payload) < mc.aead.NonceSize() {
+		return 0, errors.New("payload too short")
+	}
+	nonce := payload[:mc.aead.NonceSize()]
+	ciphertext := payload[mc.aead.NonceSize():]
+
+	plaintext, err := mc.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	copy(p, plaintext)
+	return len(plaintext), nil
+}
+
+func (mc *NDTLSConn) Close() error {
+	mc.closed.Store(true)
+	return mc.udpConn.Close()
+}
+
+func (mc *NDTLSConn) RemoteAddr() net.Addr                    { return mc.remoteAddr }
+func (mc *NDTLSConn) LocalAddr() net.Addr                     { return mc.udpConn.LocalAddr() }
+func (mc *NDTLSConn) SetDeadline(t time.Time) error           { return nil }
+func (mc *NDTLSConn) SetReadDeadline(t time.Time) error       { return nil }
+func (mc *NDTLSConn) SetWriteDeadline(t time.Time) error      { return nil }
+
+// Overhead 每包额外开销
+func (mc *NDTLSConn) Overhead() int {
+	return recordHeaderLen + mc.aead.NonceSize() + mc.aead.Overhead()
+	// 13 + 12 + 16 = 41 bytes
+}
+
+// UpdateRemoteAddr 更新远端地址（连接迁移）
+func (mc *NDTLSConn) UpdateRemoteAddr(addr net.Addr) {
+	mc.writeMu.Lock()
+	mc.remoteAddr = addr
+	mc.writeMu.Unlock()
+}
+
+// RemoteAddr 获取远端地址
+func (mc *NDTLSConn) RemoteAddrInfo() net.Addr {
+	return mc.remoteAddr
+}
+
+// replayWindow 防重放窗口（64位bitmap）
+type replayWindow struct {
+	maxSeq uint64
+	bitmap uint64 // 覆盖maxSeq前64个序列号
+}
+
+func (rw *replayWindow) Check(seq uint64) bool {
+	if seq > rw.maxSeq {
+		// 新序列号，滑动窗口
+		shift := seq - rw.maxSeq
+		if shift >= 64 {
+			rw.bitmap = 0
+		} else {
+			rw.bitmap <<= shift
+		}
+		rw.maxSeq = seq
+		rw.bitmap |= 1
+		return true
+	}
+
+	// 旧序列号，检查是否在窗口内
+	diff := rw.maxSeq - seq
+	if diff >= 64 {
+		return false // 太旧，拒绝
+	}
+
+	mask := uint64(1) << diff
+	if rw.bitmap&mask != 0 {
+		return false // 已收过，重放攻击
+	}
+	rw.bitmap |= mask
+	return true
+}
