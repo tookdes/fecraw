@@ -92,11 +92,12 @@ int telemetry_link_t::prepare_data(const char *input, int input_len,
     return input_len + kDataHeader;
 }
 
-void telemetry_link_t::commit_sent(uint64_t seq, int bytes) {
+void telemetry_link_t::commit_sent(uint64_t seq, int bytes, double send_after_s) {
     if (!enabled_ || seq == 0) return;
+    if (send_after_s < 0) send_after_s = 0;
     sent_slot_t &s = sent_[seq % kSentRing];
     s.seq = seq;
-    s.sent_at = now_s();
+    s.sent_at = now_s() + send_after_s;
     s.bytes = bytes;
     s.valid = true;
     s.acked = false;
