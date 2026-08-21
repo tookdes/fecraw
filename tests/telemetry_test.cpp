@@ -85,21 +85,43 @@ int main() {
     assert(recommended > 4);
     assert(recommended <= planner.max_parity);
 
-    // The pacer must reserve future send slots rather than sleeping the event
-    // loop. At 1 MB/s a 1000-byte packet consumes about 1 ms of pacing time.
+    // Regression for the real-link zero-throughput bug: the pacer must be
+    // completely fail-open until real feedback exists. In particular, a hard
+    // max-bandwidth setting must not seed a libev timer queue before ACK/RTT
+    // feedback can itself get through.
     pacing_t pacer;
     pacer.init(1000000);
-    uint64_t first_delay = pacer.reserve_delay_us(1000);
-    uint64_t second_delay = pacer.reserve_delay_us(1000);
-    assert(first_delay < 10000);
-    assert(second_delay > 100);
-    assert(second_delay < 10000);
+    uint64_t cold_first = pacer.reserve_delay_us(1000);
+    uint64_t cold_second = pacer.reserve_delay_us(1000);
+    assert(cold_first == 0);
+    assert(cold_second == 0);
+    assert(!pacer.has_feedback());
+    pacer.cancel_reserved(2000);
+
+    loss_snapshot_t ploss;
+    ploss.floor_trusted = true;
+    ploss.floor = 0.10;
+    ploss.loss = 0.10;
+    ploss.memoryless = true;
+    ploss.decided = 1000;
+    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, ploss);
+    assert(pacer.has_feedback());
+
+    // Once feedback bootstraps the epoch, pacing becomes active and remains
+    // non-blocking: at the 1 MB/s cap the second 1000-byte reservation should
+    // be roughly 1ms behind the first.
+    uint64_t paced_first = pacer.reserve_delay_us(1000);
+    uint64_t paced_second = pacer.reserve_delay_us(1000);
+    assert(paced_first < 10000);
+    assert(paced_second > 100);
+    assert(paced_second < 10000);
     pacer.cancel_reserved(2000);
 
     std::printf("telemetry: decided=%llu loss=%.3f burst=%.2f floor=%.3f trusted=%d; "
-                "RS 20:%d; pace=%lluus/%lluus\n",
+                "RS 20:%d; cold=%lluus/%lluus paced=%lluus/%lluus\n",
                 (unsigned long long)s.decided, s.loss, s.burst_factor, s.floor,
                 s.floor_trusted ? 1 : 0, recommended,
-                (unsigned long long)first_delay, (unsigned long long)second_delay);
+                (unsigned long long)cold_first, (unsigned long long)cold_second,
+                (unsigned long long)paced_first, (unsigned long long)paced_second);
     return 0;
 }
