@@ -147,6 +147,11 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
     do_keep_alive(raw_dest);
 }
 
+static void feedback_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
+    (void)loop; (void)watcher; (void)revents;
+    fecraw_flush_wire_feedback(raw_dest);
+}
+
 static void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     char buf[buf_len];
     int len = read(watcher->fd, buf, sizeof(buf) - 1);
@@ -257,6 +262,11 @@ int fecraw_server_event_loop() {
     ev_init(&conn_info.timer, conn_timer_cb);
     ev_timer_set(&conn_info.timer, 0, timer_interval / 1000.0);
     ev_timer_start(loop, &conn_info.timer);
+
+    ev_timer feedback_timer;
+    ev_init(&feedback_timer, feedback_timer_cb);
+    ev_timer_set(&feedback_timer, 0.010, 0.010);
+    ev_timer_start(loop, &feedback_timer);
 
     struct ev_io fifo_watcher;
     if (fifo_file[0] != 0) {
