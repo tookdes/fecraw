@@ -4,10 +4,6 @@
  * Architecture: Two threads in one process, connected by socketpair.
  *   Thread 1 (main): TUN <-> FEC encode/decode <-> socketpair[0]
  *   Thread 2 (raw):  socketpair[1] <-> udp2raw encrypt/decrypt <-> raw socket
- *
- * Thread 2 runs udp2raw's client_event_loop() via the raw_api, with the
- * socketpair fd replacing its normal UDP fd.  All udp2raw symbols are
- * localized, so there are no naming conflicts with UDPspeeder.
  */
 
 #include "common.h"
@@ -19,9 +15,7 @@
 #include "packet.h"
 #include "raw_api.h"
 #include "fecraw_config.h"
-#include "adaptive_fec.h"
-#include "small_packet.h"
-#include "pacing.h"
+#include "erasure_runtime.h"
 
 #include <pthread.h>
 #include <sys/socket.h>
@@ -33,10 +27,9 @@ static dest_t raw_dest;
 static dest_t tun_dest;
 static int bridge_fec_fd = -1;
 
-static adaptive_fec_t   g_adaptive;
-static small_packet_sender_t   g_sp_send;
+static adaptive_fec_t g_adaptive;
+static small_packet_sender_t g_sp_send;
 static small_packet_receiver_t g_sp_recv;
-static pacing_t          g_pacing;
 
 static void *raw_thread_func(void *arg) {
     int fd = *(int *)arg;
@@ -67,6 +60,10 @@ static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int reve
         return;
     }
 
+    if (!fecraw_process_wire_input(conn_info, raw_dest, data, len,
+                                    g_adaptive, g_sp_send, "client"))
+        return;
+
     char header = 0;
     if (get_header(header, data, len) != 0) {
         mylog(log_warn, "get_header failed\n");
@@ -91,9 +88,6 @@ static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int reve
         mylog(log_warn, "invalid header %d\n", int(header));
         return;
     }
-
-    if (g_cfg.enable_pacing)
-        g_pacing.on_ack(len, g_pacing.smoothed_rtt_s > 0 ? g_pacing.smoothed_rtt_s : 0.05);
 
     if (g_cfg.small_packet_threshold > 0 && small_packet_receiver_t::is_small_packet(data, len)) {
         char payload[buf_len];
@@ -126,9 +120,6 @@ static void tun_fd_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
 
     do_mssfix(data, len);
 
-    if (g_cfg.enable_pacing)
-        g_pacing.wait(len);
-
     if (g_cfg.small_packet_threshold > 0 && len < g_cfg.small_packet_threshold) {
         char frame[buf_len];
         int flen = g_sp_send.build_frame(data, len, frame, sizeof(frame));
@@ -159,38 +150,10 @@ static void fec_encode_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
     from_normal_to_fec2(conn_info, raw_dest, 0, 0, header);
 }
 
-static u64_t prev_fec_input = 0;
-static u64_t prev_fec_output = 0;
-
 static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
     conn_info.stat.report_as_client();
     if (got_feed_back) do_keep_alive(raw_dest);
-
-    if (g_cfg.fec_adaptive) {
-        u64_t cur_in  = conn_info.stat.fec_to_normal.input_packet_num;
-        u64_t cur_out = conn_info.stat.fec_to_normal.output_packet_num;
-        u64_t delta_in  = cur_in - prev_fec_input;
-        u64_t delta_out = cur_out - prev_fec_output;
-        prev_fec_input  = cur_in;
-        prev_fec_output = cur_out;
-
-        if (delta_in > 0) {
-            int sent = (int)delta_in;
-            int recovered = (sent > (int)delta_out) ? sent - (int)delta_out : 0;
-            g_adaptive.record_sent(sent);
-            if (recovered > 0)
-                g_adaptive.record_loss(recovered);
-        }
-
-        int d, p;
-        if (g_adaptive.adjust(d, p)) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%d:%d", d, p);
-            conn_info.fec_encode_manager.get_fec_par().rs_from_str(buf);
-            mylog(log_info, "adaptive FEC adjusted to %s\n", buf);
-        }
-    }
 }
 
 static void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -206,6 +169,29 @@ static void prepare_cb(struct ev_loop *loop, struct ev_prepare *watcher, int rev
 }
 
 int fecraw_client_event_loop() {
+    bool erasure_wire = g_cfg.fec_adaptive || g_cfg.enable_pacing;
+    g_fecraw_telemetry.init(erasure_wire);
+
+    if (g_cfg.fec_adaptive) {
+        int d = 20, p = 10;
+        sscanf(g_cfg.fec_str, "%d:%d", &d, &p);
+        g_adaptive.init(d, p);
+        mylog(log_info, "erasure-aware FEC enabled (base %d:%d)\n", d, p);
+    }
+    if (g_cfg.small_packet_threshold > 0) {
+        g_sp_send.init(g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
+        g_sp_recv.init();
+        mylog(log_info, "small packet mode: threshold=%d redundancy=%d\n",
+              g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
+    }
+    if (g_cfg.enable_pacing) {
+        g_fecraw_pacing.init(g_cfg.max_bandwidth);
+        mylog(log_info, "erasure-aware pacing enabled (max_bw=%lld)\n",
+              (long long)g_cfg.max_bandwidth);
+    }
+    if (erasure_wire)
+        mylog(log_info, "fecraw wire protocol v2 telemetry enabled\n");
+
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
         mylog(log_fatal, "socketpair() failed: %s\n", strerror(errno));
@@ -291,23 +277,6 @@ int fecraw_client_event_loop() {
     ev_prepare prepare_watcher;
     ev_init(&prepare_watcher, prepare_cb);
     ev_prepare_start(loop, &prepare_watcher);
-
-    if (g_cfg.fec_adaptive) {
-        int d = 20, p = 10;
-        sscanf(g_cfg.fec_str, "%d:%d", &d, &p);
-        g_adaptive.init(d, p);
-        mylog(log_info, "adaptive FEC enabled (base %d:%d)\n", d, p);
-    }
-    if (g_cfg.small_packet_threshold > 0) {
-        g_sp_send.init(g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
-        g_sp_recv.init();
-        mylog(log_info, "small packet mode: threshold=%d redundancy=%d\n",
-              g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
-    }
-    if (g_cfg.enable_pacing) {
-        g_pacing.init(g_cfg.max_bandwidth);
-        mylog(log_info, "BBR pacing enabled (max_bw=%lld)\n", (long long)g_cfg.max_bandwidth);
-    }
 
     mylog(log_info, "fecraw client event loop started\n");
     ev_run(loop, 0);
