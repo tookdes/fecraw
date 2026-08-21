@@ -21,12 +21,15 @@ BUILD_DIR = build
 
 TARGET = fecraw
 RAW_SO = $(BUILD_DIR)/libudp2raw_raw.so
+TEST_TARGET = $(BUILD_DIR)/telemetry_test
 
 # ---- FEC side objects (UDPspeeder + tinyfecVPN + fecraw glue) ----
 FEC_OBJS = \
 	$(BUILD_DIR)/main.o \
 	$(BUILD_DIR)/fecraw_client.o \
 	$(BUILD_DIR)/fecraw_server.o \
+	$(BUILD_DIR)/telemetry.o \
+	$(BUILD_DIR)/runtime.o \
 	$(BUILD_DIR)/fec_common.o \
 	$(BUILD_DIR)/fec_log.o \
 	$(BUILD_DIR)/fec_misc.o \
@@ -60,7 +63,7 @@ RAW_OBJS = \
 	$(BUILD_DIR)/pbkdf2_sha256.o \
 	$(BUILD_DIR)/ev_raw.o
 
-.PHONY: all clean install git_version_headers
+.PHONY: all clean install test git_version_headers
 
 all: $(BUILD_DIR) git_version_headers $(TARGET)
 
@@ -82,7 +85,7 @@ $(TARGET): $(FEC_OBJS) $(RAW_SO)
 		-Wl,-rpath,/usr/local/lib/fecraw $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
-# ---- fecraw glue (compiled with UDPspeeder headers) ----
+# ---- fecraw glue ----
 $(BUILD_DIR)/main.o: main.cpp
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
@@ -90,6 +93,12 @@ $(BUILD_DIR)/fecraw_client.o: fecraw_client.cpp
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 $(BUILD_DIR)/fecraw_server.o: fecraw_server.cpp
+	$(CC) $(CFLAGS_FEC) -c $< -o $@
+
+$(BUILD_DIR)/telemetry.o: telemetry.cpp telemetry.h
+	$(CC) $(CFLAGS_FEC) -c $< -o $@
+
+$(BUILD_DIR)/runtime.o: runtime.cpp pacing.h telemetry.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 # ---- UDPspeeder library sources ----
@@ -123,7 +132,7 @@ $(BUILD_DIR)/crc32.o: $(UDPSPEEDER_DIR)/crc32/Crc32.cpp
 $(BUILD_DIR)/delay_manager.o: $(UDPSPEEDER_DIR)/delay_manager.cpp
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
-$(BUILD_DIR)/packet.o: $(UDPSPEEDER_DIR)/packet.cpp
+$(BUILD_DIR)/packet.o: $(UDPSPEEDER_DIR)/packet.cpp telemetry.h pacing.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 $(BUILD_DIR)/tun_dev.o: $(TINYFEC_DIR)/tun_dev.cpp
@@ -140,7 +149,7 @@ $(BUILD_DIR)/ev_raw.o: $(UDPRAW_DIR)/my_ev.cpp
 $(BUILD_DIR)/raw_api.o: raw_api.cpp raw_api.h
 	$(CC) $(CFLAGS_RAW_API) -c $< -o $@
 
-# ---- udp2raw library sources (all PIC + hidden visibility) ----
+# ---- udp2raw library sources ----
 $(BUILD_DIR)/raw_common.o: $(UDPRAW_DIR)/common.cpp
 	$(CC) $(CFLAGS_RAW) -c $< -o $@
 
@@ -168,7 +177,7 @@ $(BUILD_DIR)/raw_log.o: $(UDPRAW_DIR)/log.cpp
 $(BUILD_DIR)/raw_fd_manager.o: $(UDPRAW_DIR)/fd_manager.cpp
 	$(CC) $(CFLAGS_RAW) -c $< -o $@
 
-# ---- udp2raw crypto (C++ sources, PIC + hidden) ----
+# ---- udp2raw crypto ----
 $(BUILD_DIR)/aes.o: $(UDPRAW_DIR)/lib/aes_faster_c/aes.cpp
 	$(CC) $(CFLAGS_RAW) -I$(UDPRAW_DIR)/lib/aes_faster_c -c $< -o $@
 
@@ -183,6 +192,13 @@ $(BUILD_DIR)/pbkdf2_sha1.o: $(UDPRAW_DIR)/lib/pbkdf2-sha1.cpp
 
 $(BUILD_DIR)/pbkdf2_sha256.o: $(UDPRAW_DIR)/lib/pbkdf2-sha256.cpp
 	$(CC) $(CFLAGS_RAW) -c $< -o $@
+
+# ---- Unit tests ----
+$(TEST_TARGET): tests/telemetry_test.cpp telemetry.cpp telemetry.h adaptive_fec.h
+	$(CC) $(CFLAGS_COMMON) -I. tests/telemetry_test.cpp telemetry.cpp -o $@ -lpthread -lrt
+
+test: $(BUILD_DIR) $(TEST_TARGET)
+	$(TEST_TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
