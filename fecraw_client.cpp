@@ -125,12 +125,10 @@ static void tun_fd_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
         int flen = g_sp_send.build_frame(data, len, frame, sizeof(frame));
         if (flen > 0) {
             int redundancy = g_sp_send.get_redundancy();
-            char cooked[buf_len];
             for (int i = 0; i < redundancy; i++) {
-                int clen = flen;
-                memcpy(cooked, frame, flen);
-                do_cook(cooked, clen);
-                send(bridge_fec_fd, cooked, clen, 0);
+                char copy[buf_len];
+                memcpy(copy, frame, flen);
+                my_send(raw_dest, copy, flen);
             }
             return;
         }
