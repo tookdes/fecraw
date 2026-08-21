@@ -164,13 +164,30 @@ int my_send(const dest_t &dest, char *data, int len) {
         }
     }
 
-    if (dest.cook) {
+    if (dest.cook)
         do_cook(send_data, send_len);
-    }
 
     // ACK feedback is control traffic and deliberately bypasses the data pacer.
-    if (telemetry_data && g_fecraw_pacing.enabled)
-        g_fecraw_pacing.wait(send_len);
+    // Data pacing is queued instead of sleeping this libev thread. The queued
+    // packet is already telemetry-framed and cooked, so cook=0 prevents the
+    // second my_send() from framing or pacing it again when its timer fires.
+    bool pacing_reserved = false;
+    if (telemetry_data && g_fecraw_pacing.enabled) {
+        uint64_t pace_delay = g_fecraw_pacing.reserve_delay_us(send_len);
+        pacing_reserved = true;
+        if (pace_delay > 0) {
+            dest_t paced_dest = dest;
+            paced_dest.cook = 0;
+            int queued = delay_manager.add((my_time_t)pace_delay, paced_dest, send_data, send_len);
+            if (queued == 0) {
+                g_fecraw_telemetry.commit_sent(
+                    telemetry_seq, send_len, (double)pace_delay / 1e6);
+                return 0;
+            }
+            g_fecraw_pacing.cancel_reserved(send_len);
+            return -1;
+        }
+    }
 
     int ret = -1;
     switch (dest.type) {
@@ -179,9 +196,10 @@ int my_send(const dest_t &dest, char *data, int len) {
             break;
         }
         case type_fd64_addr: {
-            if (!fd_manager.exist(dest.inner.fd64)) return -1;
-            int fd = fd_manager.to_fd(dest.inner.fd64);
-            ret = sendto_fd_addr(fd, dest.inner.fd64_addr.addr, send_data, send_len, 0);
+            if (fd_manager.exist(dest.inner.fd64)) {
+                int fd = fd_manager.to_fd(dest.inner.fd64);
+                ret = sendto_fd_addr(fd, dest.inner.fd64_addr.addr, send_data, send_len, 0);
+            }
             break;
         }
         case type_fd: {
@@ -193,9 +211,10 @@ int my_send(const dest_t &dest, char *data, int len) {
             break;
         }
         case type_fd64: {
-            if (!fd_manager.exist(dest.inner.fd64)) return -1;
-            int fd = fd_manager.to_fd(dest.inner.fd64);
-            ret = send_fd(fd, send_data, send_len, 0);
+            if (fd_manager.exist(dest.inner.fd64)) {
+                int fd = fd_manager.to_fd(dest.inner.fd64);
+                ret = send_fd(fd, send_data, send_len, 0);
+            }
             break;
         }
         default:
@@ -204,6 +223,8 @@ int my_send(const dest_t &dest, char *data, int len) {
 
     if (telemetry_data && ret >= 0)
         g_fecraw_telemetry.commit_sent(telemetry_seq, send_len);
+    else if (pacing_reserved && ret < 0)
+        g_fecraw_pacing.cancel_reserved(send_len);
     return ret;
 }
 
