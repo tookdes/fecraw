@@ -125,10 +125,13 @@ static void tun_fd_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
         int flen = g_sp_send.build_frame(data, len, frame, sizeof(frame));
         if (flen > 0) {
             int redundancy = g_sp_send.get_redundancy();
+            char header = got_feed_back ? header_normal : header_new_connect;
             for (int i = 0; i < redundancy; i++) {
-                char copy[buf_len];
-                memcpy(copy, frame, flen);
-                my_send(raw_dest, copy, flen);
+                char packet[buf_len];
+                int plen = flen;
+                memcpy(packet, frame, flen);
+                put_header(header, packet, plen);
+                my_send(raw_dest, packet, plen);
             }
             return;
         }
@@ -167,8 +170,9 @@ static void prepare_cb(struct ev_loop *loop, struct ev_prepare *watcher, int rev
 }
 
 int fecraw_client_event_loop() {
-    bool erasure_wire = g_cfg.fec_adaptive || g_cfg.enable_pacing;
-    g_fecraw_telemetry.init(erasure_wire);
+    // Protocol v2 is the wire format of this branch. Keep it independent of
+    // local tuning flags so peers cannot silently disagree about framing.
+    g_fecraw_telemetry.init(true);
 
     if (g_cfg.fec_adaptive) {
         int d = 20, p = 10;
@@ -187,8 +191,7 @@ int fecraw_client_event_loop() {
         mylog(log_info, "erasure-aware pacing enabled (max_bw=%lld)\n",
               (long long)g_cfg.max_bandwidth);
     }
-    if (erasure_wire)
-        mylog(log_info, "fecraw wire protocol v2 telemetry enabled\n");
+    mylog(log_info, "fecraw wire protocol v2 telemetry enabled\n");
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
