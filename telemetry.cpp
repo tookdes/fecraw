@@ -130,13 +130,10 @@ void telemetry_link_t::note_received(uint64_t seq) {
         rx_mask_lo_ |= 1;
     } else {
         uint64_t off64 = rx_largest_ - seq;
-        if (off64 >= 128) {
-            ++reordered_;
-        } else if (off64 < 64) {
+        if (off64 < 64)
             rx_mask_lo_ |= uint64_t(1) << off64;
-        } else {
+        else if (off64 < 128)
             rx_mask_hi_ |= uint64_t(1) << (off64 - 64);
-        }
     }
     ++rx_since_ack_;
     ack_pending_ = true;
@@ -203,15 +200,18 @@ loss_snapshot_t telemetry_link_t::raw_snapshot() const {
             s.memoryless = std::fabs(s.loss_after_arrival - s.loss) / stderr < 3.0;
     }
 
-    double recent = round_samples_ > 0 ? (double)round_losses_ / round_samples_ : 0;
-    double minimum = recent;
+    double partial = round_samples_ > 0 ? (double)round_losses_ / round_samples_ : 0;
+    double recent = partial;
+    double minimum = partial;
     if (rounds_count_ > 0) {
         minimum = rounds_[0];
         for (int i = 1; i < rounds_count_; ++i) minimum = std::min(minimum, rounds_[i]);
         int last = rounds_count_ < 8 ? rounds_count_ - 1 : (round_at_ + 7) % 8;
         recent = rounds_[last];
-        if (round_samples_ >= kRoundSamples / 4)
-            recent = (double)round_losses_ / round_samples_;
+        if (round_samples_ >= kRoundSamples / 4) {
+            recent = partial;
+            minimum = std::min(minimum, partial);
+        }
     }
     s.recent = recent;
     s.floor = minimum;
@@ -224,10 +224,21 @@ void telemetry_link_t::refresh_floor_trust() {
     if (!s.memoryless || s.samples < kMinMemorylessTransitions) return;
     double candidate = s.floor > 0 ? s.floor : s.loss;
     if (candidate <= 0 || candidate >= 0.85) return;
+
     if (!floor_trusted_ || candidate < established_floor_) {
         floor_trusted_ = true;
         established_floor_ = candidate;
+        return;
     }
+
+    // fecraw does not replace the outer connection on every physical path
+    // change. Once the old minimum has rotated out of a full eight-round
+    // window, allow a persistently memoryless higher floor to become the new
+    // baseline. Bursty queue loss fails the memoryless test and cannot ratchet
+    // this upward.
+    if (rounds_count_ == 8 && s.burst_factor < 1.30 &&
+        candidate > established_floor_ * 1.15)
+        established_floor_ = candidate;
 }
 
 loss_snapshot_t telemetry_link_t::snapshot() const {
@@ -248,21 +259,28 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
     uint64_t decided_bytes = 0;
     double best_rtt = 0;
 
-    // First remember every positive ACK still represented by this bitmap.
+    // Positive acknowledgements are sampled immediately, even if an earlier
+    // gap is still inside the reorder tolerance. This keeps RTT and delivery
+    // rate from inheriting artificial head-of-line delay from loss detection.
     for (unsigned off = 0; off < 128 && largest >= off; ++off) {
         if (!ack_bit(mask_lo, mask_hi, off)) continue;
         uint64_t seq = largest - off;
+        if (seq < next_decide_) {
+            ++reordered_;
+            continue;
+        }
         sent_slot_t &slot = sent_[seq % kSentRing];
-        if (slot.valid && slot.seq == seq) slot.acked = true;
+        if (!slot.valid || slot.seq != seq || slot.acked) continue;
+        slot.acked = true;
+        acked_bytes += (uint64_t)std::max(slot.bytes, 0);
+        double sample = now - slot.sent_at;
+        if (sample > 0 && (best_rtt <= 0 || sample < best_rtt)) best_rtt = sample;
     }
 
     while (next_decide_ <= largest) {
         uint64_t distance = largest - next_decide_;
         sent_slot_t &slot = sent_[next_decide_ % kSentRing];
-        bool known_acked = slot.valid && slot.seq == next_decide_ && slot.acked;
-        bool represented = distance < 128;
-        bool current_acked = represented && ack_bit(mask_lo, mask_hi, (unsigned)distance);
-        bool arrived = known_acked || current_acked;
+        bool arrived = slot.valid && slot.seq == next_decide_ && slot.acked;
 
         if (!arrived && distance < kReorderTolerance) break;
         if (!slot.valid || slot.seq != next_decide_) {
@@ -272,11 +290,6 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
 
         record_outcome(arrived);
         decided_bytes += (uint64_t)std::max(slot.bytes, 0);
-        if (arrived) {
-            acked_bytes += (uint64_t)std::max(slot.bytes, 0);
-            double sample = now - slot.sent_at;
-            if (sample > 0 && (best_rtt <= 0 || sample < best_rtt)) best_rtt = sample;
-        }
         slot.valid = false;
         ++next_decide_;
     }
