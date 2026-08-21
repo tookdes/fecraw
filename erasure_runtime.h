@@ -18,6 +18,7 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
                                          small_packet_sender_t &small_sender,
                                          const telemetry_feedback_t &fb,
                                          const char *role) {
+    (void)conn_info;
     if (!fb.updated) return;
 
     if (g_cfg.enable_pacing) {
@@ -35,9 +36,19 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
         if (adaptive.adjust(fb.loss, fb.rtt_s, data, parity)) {
             char fec[64];
             snprintf(fec, sizeof(fec), "%d:%d", data, parity);
-            if (conn_info.fec_encode_manager.get_fec_par().rs_from_str(fec) == 0) {
+
+            // Do not rewrite fec_encode_manager's active parameters in the
+            // middle of a block. UDPspeeder already has a versioned global
+            // parameter handoff: input() clones g_fec_par only when its block
+            // counter is zero. Publish the new RS table there and let the next
+            // block adopt it atomically.
+            fec_parameter_t next;
+            if (next.rs_from_str(fec) == 0) {
+                int version = g_fec_par.version;
+                g_fec_par.copy_fec(next);
+                g_fec_par.version = version + 1;
                 mylog(log_info,
-                      "[%s] erasure FEC -> %s floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
+                      "[%s] erasure FEC scheduled -> %s floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
                       role, fec, fb.loss.floor, fb.loss.loss, fb.loss.burst_factor,
                       fb.rtt_s * 1000.0);
             }
@@ -71,6 +82,17 @@ static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
     if (ack_len > 0)
         my_send(feedback_dest, ack, ack_len);
     return true;
+}
+
+// Flush a delayed ACK when the packet-count trigger did not fire. Both event
+// loops run this on a 10ms timer so a sparse interactive exchange never waits
+// for the 400ms connection timer before producing RTT feedback.
+static inline void fecraw_flush_wire_feedback(dest_t &feedback_dest) {
+    if (!g_fecraw_telemetry.enabled()) return;
+    char ack[64];
+    int ack_len = g_fecraw_telemetry.build_ack(ack, sizeof(ack), true);
+    if (ack_len > 0)
+        my_send(feedback_dest, ack, ack_len);
 }
 
 #endif // FECRAW_ERASURE_RUNTIME_H_
