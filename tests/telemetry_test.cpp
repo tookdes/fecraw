@@ -1,5 +1,6 @@
 #include "telemetry.h"
 #include "adaptive_fec.h"
+#include "pacing.h"
 
 #include <cassert>
 #include <cstdio>
@@ -84,8 +85,21 @@ int main() {
     assert(recommended > 4);
     assert(recommended <= planner.max_parity);
 
-    std::printf("telemetry: decided=%llu loss=%.3f burst=%.2f floor=%.3f trusted=%d; RS 20:%d\n",
+    // The pacer must reserve future send slots rather than sleeping the event
+    // loop. At 1 MB/s a 1000-byte packet consumes about 1 ms of pacing time.
+    pacing_t pacer;
+    pacer.init(1000000);
+    uint64_t first_delay = pacer.reserve_delay_us(1000);
+    uint64_t second_delay = pacer.reserve_delay_us(1000);
+    assert(first_delay < 10000);
+    assert(second_delay > 100);
+    assert(second_delay < 10000);
+    pacer.cancel_reserved(2000);
+
+    std::printf("telemetry: decided=%llu loss=%.3f burst=%.2f floor=%.3f trusted=%d; "
+                "RS 20:%d; pace=%lluus/%lluus\n",
                 (unsigned long long)s.decided, s.loss, s.burst_factor, s.floor,
-                s.floor_trusted ? 1 : 0, recommended);
+                s.floor_trusted ? 1 : 0, recommended,
+                (unsigned long long)first_delay, (unsigned long long)second_delay);
     return 0;
 }
