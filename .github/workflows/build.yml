@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, feat/erasure-aware-fec-v2]
     tags: ['v*']
   pull_request:
     branches: [master, main]
@@ -17,6 +17,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ libssl-dev
+
+      - name: Unit tests
+        run: make test
 
       - name: Build
         run: make
