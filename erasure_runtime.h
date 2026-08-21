@@ -77,7 +77,9 @@ static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
     fecraw_apply_feedback(conn_info, adaptive, small_sender, fb, role);
     if (is_control) return false;
 
-    char ack[64];
+    // my_send() cooks this control frame after build_ack(). buf_len leaves
+    // room for CRC + the maximum obscure IV in addition to the 28-byte ACK.
+    char ack[buf_len];
     int ack_len = g_fecraw_telemetry.build_ack(ack, sizeof(ack));
     if (ack_len > 0)
         my_send(feedback_dest, ack, ack_len);
@@ -89,7 +91,7 @@ static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
 // for the 400ms connection timer before producing RTT feedback.
 static inline void fecraw_flush_wire_feedback(dest_t &feedback_dest) {
     if (!g_fecraw_telemetry.enabled()) return;
-    char ack[64];
+    char ack[buf_len];
     int ack_len = g_fecraw_telemetry.build_ack(ack, sizeof(ack), true);
     if (ack_len > 0)
         my_send(feedback_dest, ack, ack_len);
