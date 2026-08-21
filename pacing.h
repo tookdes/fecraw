@@ -4,16 +4,21 @@
 /*
  * Erasure-aware BBR-lite pacer.
  *
- * Unlike the old implementation, this controller never treats reverse data as
- * an ACK and never invents an RTT. It consumes protocol-v2 telemetry feedback
- * for packets this endpoint actually sent. The delivered-rate estimate is
- * compensated only for a trusted rate-independent erasure floor; excess loss
- * and burst growth are treated as congestion instead of being coded around.
+ * The controller consumes protocol-v2 telemetry feedback for packets this
+ * endpoint actually sent. The delivered-rate estimate is compensated only for
+ * a trusted rate-independent erasure floor; excess loss and burst growth are
+ * treated as congestion instead of being coded around.
  *
- * The pacer is deliberately non-blocking. reserve_delay_us() assigns a wire
- * send time and returns immediately; packet.cpp places the already-framed
- * packet into UDPspeeder's existing delay_manager. ACK processing therefore
- * remains runnable while the sender is rate-limited.
+ * Liveness rule: pacing is fail-open. Before we have a real RTT + delivery-rate
+ * sample, packets bypass the delay queue completely. If feedback later goes
+ * stale, the pacing epoch is reset and traffic bypasses the queue again until a
+ * fresh sample arrives. This prevents the libev timer queue from becoming part
+ * of the feedback bootstrap dependency.
+ *
+ * Once feedback is live, reserve_delay_us() is deliberately non-blocking. It
+ * assigns a wire send time and returns immediately; packet.cpp places the
+ * already-framed packet into UDPspeeder's existing delay_manager. ACK handling
+ * therefore remains runnable while the sender is rate-limited.
  */
 
 #include "telemetry.h"
@@ -47,7 +52,7 @@ struct pacing_t {
     volatile int64_t bytes_in_flight;
     int64_t cwnd;
     int64_t pacing_rate;
-    int64_t max_bandwidth;     // bytes/s hard cap, 0 = unlimited
+    int64_t max_bandwidth;     // bytes/s hard cap after feedback bootstrap
     double next_send_s;        // reserved wire time for the next data packet
 
     bbr_state_t state;
@@ -57,6 +62,12 @@ struct pacing_t {
     double last_probe_rtt;
     double congestion_scale;
     bool enabled;
+
+    // Cold-start / liveness state. No packet enters delay_manager until a real
+    // feedback sample has established both RTT and delivered rate.
+    bool feedback_ready;
+    int feedback_samples;
+    double last_feedback_s;
 
     int64_t bw_samples[10];
     int bw_sample_idx;
@@ -74,7 +85,9 @@ struct pacing_t {
         smoothed_rtt_s = 0;
         bytes_in_flight = 0;
         cwnd = BBR_INIT_CWND;
-        pacing_rate = max_bw_limit > 0 ? max_bw_limit : 0;
+        // Deliberately zero during bootstrap. max_bandwidth is enforced once
+        // telemetry has established a pacing epoch; bootstrap itself is direct.
+        pacing_rate = 0;
         max_bandwidth = max_bw_limit;
         next_send_s = now_s();
         state = BBR_STARTUP;
@@ -84,29 +97,43 @@ struct pacing_t {
         last_probe_rtt = next_send_s;
         congestion_scale = 1.0;
         enabled = true;
+        feedback_ready = false;
+        feedback_samples = 0;
+        last_feedback_s = 0;
         std::memset(bw_samples, 0, sizeof(bw_samples));
         bw_sample_idx = 0;
     }
 
     void destroy() { pthread_mutex_destroy(&mu); }
 
+    bool has_feedback() const { return feedback_ready; }
+
     // Reserve this many bytes in the aggregate sender and return how long the
     // caller should defer the packet. This never sleeps or waits for cwnd.
     uint64_t reserve_delay_us(int size) {
         if (!enabled || size <= 0) return 0;
         pthread_mutex_lock(&mu);
+
+        double now = now_s();
+        maybe_fail_open(now);
         bytes_in_flight += size;
 
-        int64_t rate = pacing_rate;
-        if (rate <= 0) {
+        // Critical cold-start behavior: do not enqueue before real feedback.
+        if (!feedback_ready || pacing_rate <= 0) {
             pthread_mutex_unlock(&mu);
             return 0;
         }
 
-        double now = now_s();
-        if (next_send_s < now) next_send_s = now;
+        // If userspace/timer scheduling fell behind far enough to build a long
+        // queue, discard the stale schedule rather than amplifying the stall.
+        double queue_guard = 0.100;
+        if (smoothed_rtt_s > 0)
+            queue_guard = std::max(0.050, std::min(0.500, smoothed_rtt_s * 2.0));
+        if (next_send_s < now || next_send_s - now > queue_guard)
+            next_send_s = now;
+
         double send_at = next_send_s;
-        next_send_s += (double)size / (double)rate;
+        next_send_s += (double)size / (double)pacing_rate;
         double delay = send_at - now;
         pthread_mutex_unlock(&mu);
 
@@ -130,6 +157,9 @@ struct pacing_t {
         if (!enabled) return;
         pthread_mutex_lock(&mu);
 
+        double now = now_s();
+        last_feedback_s = now;
+
         if (decided_bytes > 0) {
             bytes_in_flight -= (int64_t)decided_bytes;
             if (bytes_in_flight < 0) bytes_in_flight = 0;
@@ -148,10 +178,20 @@ struct pacing_t {
                 if (arrival < 0.15) arrival = 0.15;
             }
             int64_t wire_sample = (int64_t)(delivered_rate / arrival);
+            if (wire_sample < 1) wire_sample = 1;
             bw_samples[bw_sample_idx++ % 10] = wire_sample;
             max_wire_bw = 0;
             for (int i = 0; i < 10; ++i)
                 if (bw_samples[i] > max_wire_bw) max_wire_bw = bw_samples[i];
+
+            ++feedback_samples;
+            if (!feedback_ready && smoothed_rtt_s > 0 && max_wire_bw > 0) {
+                feedback_ready = true;
+                // Start the pacing timeline at this instant. Never inherit a
+                // timestamp accumulated during the feedback-free period.
+                next_send_s = now;
+                bytes_in_flight = 0;
+            }
 
             if (state == BBR_STARTUP) {
                 if (last_growth_bw == 0 || wire_sample > last_growth_bw * 5 / 4) {
@@ -179,7 +219,6 @@ struct pacing_t {
             if (congestion_scale > 1.0) congestion_scale = 1.0;
         }
 
-        double now = now_s();
         if (state != BBR_STARTUP && min_rtt_s < 1e8 && now - last_probe_rtt > 10.0) {
             state = BBR_PROBE_RTT;
             last_probe_rtt = now;
@@ -198,6 +237,24 @@ struct pacing_t {
     }
 
 private:
+    void maybe_fail_open(double now) {
+        if (!feedback_ready || last_feedback_s <= 0) return;
+        double stale_after = 0.75;
+        if (smoothed_rtt_s > 0)
+            stale_after = std::max(0.75, std::min(3.0, smoothed_rtt_s * 4.0));
+        if (now - last_feedback_s <= stale_after) return;
+
+        feedback_ready = false;
+        feedback_samples = 0;
+        next_send_s = now;
+        pacing_rate = 0;
+        bytes_in_flight = 0;
+        state = BBR_STARTUP;
+        cycle_idx = 0;
+        plateau_samples = 0;
+        last_growth_bw = 0;
+    }
+
     int64_t bdp() const {
         if (max_wire_bw <= 0 || min_rtt_s >= 1e8) return BBR_INIT_CWND;
         int64_t v = (int64_t)((double)max_wire_bw * min_rtt_s);
@@ -205,29 +262,30 @@ private:
     }
 
     void update_limits() {
+        if (!feedback_ready || max_wire_bw <= 0) {
+            pacing_rate = 0;
+            cwnd = BBR_INIT_CWND;
+            return;
+        }
+
         double gain = 1.0;
         if (state == BBR_STARTUP) gain = BBR_STARTUP_GAIN;
         else if (state == BBR_DRAIN) gain = BBR_DRAIN_GAIN;
         else if (state == BBR_PROBE_BW) gain = BBR_PROBE_BW_GAINS[cycle_idx % 8];
         else if (state == BBR_PROBE_RTT) {
             cwnd = BBR_PROBE_RTT_CWND;
-            pacing_rate = max_wire_bw > 0 ? max_wire_bw / 2 : 0;
-            if (max_bandwidth > 0 && (pacing_rate == 0 || pacing_rate > max_bandwidth))
+            pacing_rate = max_wire_bw / 2;
+            if (max_bandwidth > 0 && pacing_rate > max_bandwidth)
                 pacing_rate = max_bandwidth;
             return;
         }
 
-        int64_t base = max_wire_bw;
-        if (base > 0) {
-            pacing_rate = (int64_t)((double)base * gain * congestion_scale);
-            cwnd = (int64_t)((double)bdp() * std::max(gain, 1.0) * congestion_scale);
-        } else {
-            pacing_rate = max_bandwidth > 0 ? max_bandwidth : 0;
-            cwnd = BBR_INIT_CWND;
-        }
+        pacing_rate = (int64_t)((double)max_wire_bw * gain * congestion_scale);
+        cwnd = (int64_t)((double)bdp() * std::max(gain, 1.0) * congestion_scale);
         if (cwnd < BBR_MIN_CWND) cwnd = BBR_MIN_CWND;
-        if (max_bandwidth > 0 && (pacing_rate == 0 || pacing_rate > max_bandwidth))
+        if (max_bandwidth > 0 && pacing_rate > max_bandwidth)
             pacing_rate = max_bandwidth;
+        if (pacing_rate < 1) pacing_rate = 1;
     }
 };
 
