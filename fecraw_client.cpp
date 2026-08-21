@@ -16,9 +16,11 @@
 #include "raw_api.h"
 #include "fecraw_config.h"
 #include "erasure_runtime.h"
+#include "window_rlnc.h"
 
 #include <pthread.h>
 #include <sys/socket.h>
+#include <vector>
 
 extern fecraw_config_t g_cfg;
 
@@ -30,11 +32,69 @@ static int bridge_fec_fd = -1;
 static adaptive_fec_t g_adaptive;
 static small_packet_sender_t g_sp_send;
 static small_packet_receiver_t g_sp_recv;
+static window_rlnc_sender_t g_rlnc_send;
+static window_rlnc_receiver_t g_rlnc_recv;
+static int g_tx_codec = FECRAW_CODEC_RS;
 
 static void *raw_thread_func(void *arg) {
     int fd = *(int *)arg;
     raw_api_client_loop(fd);
     return NULL;
+}
+
+static int choose_tx_codec() {
+    if (g_cfg.disable_fec) return FECRAW_CODEC_RS;
+    if (g_cfg.fec_codec != FECRAW_CODEC_AUTO) return g_cfg.fec_codec;
+
+    // Auto starts on the already-proven RS path. Move to sliding-window RLNC
+    // only after this direction has a trusted erasure floor and a WAN-scale
+    // RTT, where avoiding a block/retransmission round trip is valuable.
+    loss_snapshot_t s = g_fecraw_telemetry.snapshot();
+    double rtt = g_fecraw_telemetry.smoothed_rtt_s();
+    if (s.floor_trusted && s.floor >= 0.02 && rtt >= 0.060)
+        return FECRAW_CODEC_RLNC;
+    return FECRAW_CODEC_RS;
+}
+
+static void send_rlnc_packet(char *data, int len, char header) {
+    if (g_cfg.fec_adaptive)
+        g_rlnc_send.set_rate(g_adaptive.data_shards, g_adaptive.parity_shards);
+
+    std::vector<std::vector<char> > frames;
+    if (g_rlnc_send.encode_packet(data, len, frames) != 0) {
+        mylog(log_warn, "client RLNC encode failed len=%d\n", len);
+        return;
+    }
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (frames[i].size() + 1 >= (size_t)buf_len) {
+            mylog(log_warn, "client RLNC frame too large: %d\n", (int)frames[i].size());
+            continue;
+        }
+        char packet[buf_len];
+        int plen = (int)frames[i].size();
+        memcpy(packet, frames[i].data(), frames[i].size());
+        put_header(header, packet, plen);
+        my_send(raw_dest, packet, plen);
+    }
+}
+
+static void send_data_packet(conn_info_t &conn_info, char *data, int len, char header) {
+    int desired = choose_tx_codec();
+    if (desired != g_tx_codec) {
+        // RS may have a partially-filled sealed block. Flush it before changing
+        // formats; RLNC has no sealed block, so leaving it only drops history.
+        if (g_tx_codec == FECRAW_CODEC_RS)
+            from_normal_to_fec2(conn_info, raw_dest, 0, 0, header);
+        else
+            g_rlnc_send.reset_window();
+        g_tx_codec = desired;
+        mylog(log_info, "[client] tx codec -> %s\n", fecraw_codec_name(g_tx_codec));
+    }
+
+    if (g_tx_codec == FECRAW_CODEC_RLNC)
+        send_rlnc_packet(data, len, header);
+    else
+        from_normal_to_fec2(conn_info, raw_dest, data, len, header);
 }
 
 static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -99,6 +159,23 @@ static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int reve
         return;
     }
 
+    // RLNC frames are self-identifying, so AUTO can switch independently in
+    // either direction without a separate wire negotiation.
+    if (window_rlnc_receiver_t::is_frame(data, len)) {
+        std::vector<std::vector<char> > packets;
+        if (g_rlnc_recv.receive(data, len, packets) != 0) {
+            mylog(log_warn, "client RLNC decode failed\n");
+            return;
+        }
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (!packets[i].empty()) {
+                int wlen = write(tun_dest.inner.fd, packets[i].data(), packets[i].size());
+                (void)wlen;
+            }
+        }
+        return;
+    }
+
     from_fec_to_normal2(conn_info, tun_dest, data, len);
 }
 
@@ -138,7 +215,7 @@ static void tun_fd_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
     }
 
     char header = got_feed_back ? header_normal : header_new_connect;
-    from_normal_to_fec2(conn_info, raw_dest, data, len, header);
+    send_data_packet(conn_info, data, len, header);
 }
 
 static void delay_manager_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
@@ -147,6 +224,7 @@ static void delay_manager_cb(struct ev_loop *loop, struct ev_timer *watcher, int
 
 static void fec_encode_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
+    if (g_tx_codec != FECRAW_CODEC_RS) return;
     char header = got_feed_back ? header_normal : header_new_connect;
     from_normal_to_fec2(conn_info, raw_dest, 0, 0, header);
 }
@@ -179,12 +257,16 @@ int fecraw_client_event_loop() {
     // local tuning flags so peers cannot silently disagree about framing.
     g_fecraw_telemetry.init(true);
 
+    auto tail = g_fec_par.get_tail();
+    int base_data = (int)tail.x;
+    int base_parity = (int)tail.y;
+    g_rlnc_send.init(g_cfg.rlnc_window, g_cfg.fec_mtu, base_data, base_parity);
+    g_rlnc_recv.init();
+    g_tx_codec = g_cfg.fec_codec == FECRAW_CODEC_RLNC ? FECRAW_CODEC_RLNC : FECRAW_CODEC_RS;
+
     if (g_cfg.fec_adaptive) {
-        auto tail = g_fec_par.get_tail();
-        int d = (int)tail.x;
-        int p = (int)tail.y;
-        g_adaptive.init(d, p);
-        mylog(log_info, "erasure-aware FEC enabled (base %d:%d)\n", d, p);
+        g_adaptive.init(base_data, base_parity);
+        mylog(log_info, "erasure-aware FEC enabled (base %d:%d)\n", base_data, base_parity);
     }
     if (g_cfg.small_packet_threshold > 0) {
         g_sp_send.init(g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
@@ -194,10 +276,11 @@ int fecraw_client_event_loop() {
     }
     if (g_cfg.enable_pacing) {
         g_fecraw_pacing.init(g_cfg.max_bandwidth);
-        mylog(log_info, "erasure-aware pacing enabled (max_bw=%lld)\n",
+        mylog(log_info, "erasure-aware pacing enabled (cold-start fail-open, max_bw=%lld)\n",
               (long long)g_cfg.max_bandwidth);
     }
-    mylog(log_info, "fecraw wire protocol v2 telemetry enabled\n");
+    mylog(log_info, "fecraw wire protocol v2 telemetry enabled, codec=%s rlnc_window=%d\n",
+          fecraw_codec_name(g_cfg.fec_codec), g_cfg.rlnc_window);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
