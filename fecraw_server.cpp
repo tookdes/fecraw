@@ -170,8 +170,9 @@ int fecraw_server_event_loop() {
     g_fecraw_telemetry.init(true);
 
     if (g_cfg.fec_adaptive) {
-        int d = 20, p = 10;
-        sscanf(g_cfg.fec_str, "%d:%d", &d, &p);
+        auto tail = g_fec_par.get_tail();
+        int d = (int)tail.x;
+        int p = (int)tail.y;
         g_srv_adaptive.init(d, p);
         mylog(log_info, "erasure-aware FEC enabled (base %d:%d)\n", d, p);
     }
