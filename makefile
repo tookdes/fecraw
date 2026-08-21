@@ -22,6 +22,7 @@ BUILD_DIR = build
 TARGET = fecraw
 RAW_SO = $(BUILD_DIR)/libudp2raw_raw.so
 TEST_TARGET = $(BUILD_DIR)/telemetry_test
+RLNC_TEST_TARGET = $(BUILD_DIR)/window_rlnc_test
 
 # ---- FEC side objects (UDPspeeder + tinyfecVPN + fecraw glue) ----
 FEC_OBJS = \
@@ -30,6 +31,7 @@ FEC_OBJS = \
 	$(BUILD_DIR)/fecraw_server.o \
 	$(BUILD_DIR)/telemetry.o \
 	$(BUILD_DIR)/runtime.o \
+	$(BUILD_DIR)/window_rlnc.o \
 	$(BUILD_DIR)/fec_common.o \
 	$(BUILD_DIR)/fec_log.o \
 	$(BUILD_DIR)/fec_misc.o \
@@ -89,16 +91,19 @@ $(TARGET): $(FEC_OBJS) $(RAW_SO)
 $(BUILD_DIR)/main.o: main.cpp
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
-$(BUILD_DIR)/fecraw_client.o: fecraw_client.cpp
+$(BUILD_DIR)/fecraw_client.o: fecraw_client.cpp window_rlnc.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
-$(BUILD_DIR)/fecraw_server.o: fecraw_server.cpp
+$(BUILD_DIR)/fecraw_server.o: fecraw_server.cpp window_rlnc.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 $(BUILD_DIR)/telemetry.o: telemetry.cpp telemetry.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 $(BUILD_DIR)/runtime.o: runtime.cpp pacing.h telemetry.h
+	$(CC) $(CFLAGS_FEC) -c $< -o $@
+
+$(BUILD_DIR)/window_rlnc.o: window_rlnc.cpp window_rlnc.h
 	$(CC) $(CFLAGS_FEC) -c $< -o $@
 
 # ---- UDPspeeder library sources ----
@@ -194,11 +199,15 @@ $(BUILD_DIR)/pbkdf2_sha256.o: $(UDPRAW_DIR)/lib/pbkdf2-sha256.cpp
 	$(CC) $(CFLAGS_RAW) -c $< -o $@
 
 # ---- Unit tests ----
-$(TEST_TARGET): tests/telemetry_test.cpp telemetry.cpp telemetry.h adaptive_fec.h
+$(TEST_TARGET): tests/telemetry_test.cpp telemetry.cpp telemetry.h adaptive_fec.h pacing.h
 	$(CC) $(CFLAGS_COMMON) -I. tests/telemetry_test.cpp telemetry.cpp -o $@ -lpthread -lrt
 
-test: $(BUILD_DIR) $(TEST_TARGET)
+$(RLNC_TEST_TARGET): tests/window_rlnc_test.cpp window_rlnc.cpp window_rlnc.h
+	$(CC) $(CFLAGS_COMMON) -I. tests/window_rlnc_test.cpp window_rlnc.cpp -o $@
+
+test: $(BUILD_DIR) $(TEST_TARGET) $(RLNC_TEST_TARGET)
 	$(TEST_TARGET)
+	$(RLNC_TEST_TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
