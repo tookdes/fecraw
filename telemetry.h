@@ -46,10 +46,11 @@ public:
     bool enabled() const { return enabled_; }
 
     // Build a protocol-v2 DATA frame. commit_sent() must be called after the
-    // local socket send attempt so RTT/in-flight accounting starts at send.
+    // local send is accepted, or when a paced packet is successfully queued.
+    // send_after_s shifts the RTT epoch to the reserved wire time.
     int prepare_data(const char *input, int input_len,
                      char *output, int output_cap, uint64_t &seq);
-    void commit_sent(uint64_t seq, int bytes);
+    void commit_sent(uint64_t seq, int bytes, double send_after_s = 0);
 
     // Consume a de-cooked protocol-v2 frame in place. DATA frames are stripped
     // to their original fecraw payload. ACK frames set is_control=true and are
