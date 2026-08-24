@@ -31,11 +31,15 @@ struct telemetry_feedback_t {
     uint64_t decided_bytes;
     double rtt_s;
     double delivery_rate;
+    // True only when this ACK produced a new delivery-rate observation. The
+    // cached delivery_rate is still carried on other feedback for diagnostics,
+    // but congestion control must not count it as another BBR sample.
+    bool delivery_sampled;
     loss_snapshot_t loss;
 
     telemetry_feedback_t()
         : updated(false), acked_bytes(0), decided_bytes(0),
-          rtt_s(0), delivery_rate(0) {}
+          rtt_s(0), delivery_rate(0), delivery_sampled(false) {}
 };
 
 class telemetry_link_t {
@@ -52,14 +56,8 @@ public:
                      char *output, int output_cap, uint64_t &seq);
     void commit_sent(uint64_t seq, int bytes, double send_after_s = 0);
 
-    // Consume a de-cooked protocol-v2 frame in place. DATA frames are stripped
-    // to their original fecraw payload. ACK frames set is_control=true and are
-    // consumed completely. feedback is populated when ACK evidence decides
-    // one or more locally-sent packet outcomes.
     int consume(char *data, int &len, bool &is_control,
                 telemetry_feedback_t &feedback);
-
-    // Build a feedback ACK frame. Returns 0 when no ACK is due.
     int build_ack(char *output, int output_cap, bool force = false);
 
     loss_snapshot_t snapshot() const;
@@ -67,8 +65,8 @@ public:
     double smoothed_rtt_s() const { return srtt_s_; }
     double delivery_rate() const { return delivery_rate_; }
 
-    static const int kDataHeader = 12; // magic/version/type + uint64 sequence
-    static const int kAckFrame = 28;   // magic/version/type + largest + 128-bit map
+    static const int kDataHeader = 12;
+    static const int kAckFrame = 28;
 
 private:
     enum { kSentRing = 8192, kAckBits = 128, kReorderTolerance = 32 };
@@ -77,15 +75,19 @@ private:
         uint64_t seq;
         double sent_at;
         int bytes;
+        uint64_t sent_total;
         bool valid;
         bool acked;
-        sent_slot_t() : seq(0), sent_at(0), bytes(0), valid(false), acked(false) {}
+        sent_slot_t()
+            : seq(0), sent_at(0), bytes(0), sent_total(0),
+              valid(false), acked(false) {}
     };
 
     bool enabled_;
     uint64_t tx_next_;
     uint64_t next_decide_;
     sent_slot_t sent_[kSentRing];
+    uint64_t total_sent_bytes_;
 
     bool rx_started_;
     uint64_t rx_largest_;
@@ -95,8 +97,6 @@ private:
     bool ack_pending_;
     double last_ack_at_;
 
-    // Markov loss estimator, adapted from Queqiao's lossmodel. The floor is a
-    // lower envelope; only a statistically memoryless regime may establish it.
     double samples_;
     double losses_;
     double from_arrival_;
@@ -118,8 +118,17 @@ private:
     double min_rtt_s_;
     double srtt_s_;
     double delivery_rate_;
-    double rate_epoch_;
-    uint64_t rate_acked_bytes_;
+
+    // BBR-shaped delivery sampler. It starts at the first positive ACK rather
+    // than process startup, then bounds ACK arrival slope by the corresponding
+    // send slope. This avoids both long-RTT first-sample dilution and ACK
+    // compression. Only a completed pair of points produces delivery_sampled.
+    bool rate_started_;
+    uint64_t delivered_bytes_;
+    double last_ack_point_time_;
+    uint64_t last_ack_point_delivered_;
+    double last_ack_point_sent_time_;
+    uint64_t last_ack_point_sent_bytes_;
 
     static double now_s();
     static void put_u64(char *p, uint64_t v);

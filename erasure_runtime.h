@@ -23,7 +23,8 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
 
     if (g_cfg.enable_pacing) {
         g_fecraw_pacing.on_feedback(fb.acked_bytes, fb.decided_bytes,
-                                    fb.rtt_s, fb.delivery_rate, fb.loss);
+                                    fb.rtt_s, fb.delivery_rate,
+                                    fb.delivery_sampled, fb.loss);
     }
 
     if (g_cfg.small_packet_threshold > 0) {
@@ -32,23 +33,33 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
     }
 
     if (g_cfg.fec_adaptive) {
+        // RLNC asks a different sizing question than sealed-block RS. Keep its
+        // continuous WindowRate current even when the integer RS ratio happens
+        // not to change, so AUTO can switch codecs without inheriting 20:13.
+        double window_rate = adaptive.get_window_rate();
+        if (adaptive.adjust_window_rate(g_cfg.rlnc_window, fb.loss, fb.rtt_s,
+                                        window_rate)) {
+            mylog(log_info,
+                  "[%s] RLNC window rate -> %.4f repair/source window=%d floor=%.3f rtt=%.1fms\n",
+                  role, window_rate, g_cfg.rlnc_window, fb.loss.floor,
+                  fb.rtt_s * 1000.0);
+        }
+
         int data = 0, parity = 0;
         if (adaptive.adjust(fb.loss, fb.rtt_s, data, parity)) {
             char fec[64];
             snprintf(fec, sizeof(fec), "%d:%d", data, parity);
 
             // Do not rewrite fec_encode_manager's active parameters in the
-            // middle of a block. UDPspeeder already has a versioned global
-            // parameter handoff: input() clones g_fec_par only when its block
-            // counter is zero. Publish the new RS table there and let the next
-            // block adopt it atomically.
+            // middle of a block. UDPspeeder clones the versioned global table
+            // only when its current block counter is zero.
             fec_parameter_t next;
             if (next.rs_from_str(fec) == 0) {
                 int version = g_fec_par.version;
                 g_fec_par.copy_fec(next);
                 g_fec_par.version = version + 1;
                 mylog(log_info,
-                      "[%s] erasure FEC scheduled -> %s floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
+                      "[%s] erasure RS scheduled -> %s floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
                       role, fec, fb.loss.floor, fb.loss.loss, fb.loss.burst_factor,
                       fb.rtt_s * 1000.0);
             }
@@ -56,9 +67,6 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
     }
 }
 
-// Called after udp2raw decryption and UDPspeeder de_cook(), before the legacy
-// fecraw header/FEC decoder. Returns false when the frame was protocol-v2
-// control traffic or malformed and therefore must not enter the legacy path.
 static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
                                               dest_t &feedback_dest,
                                               char *data, int &len,
@@ -77,8 +85,6 @@ static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
     fecraw_apply_feedback(conn_info, adaptive, small_sender, fb, role);
     if (is_control) return false;
 
-    // my_send() cooks this control frame after build_ack(). buf_len leaves
-    // room for CRC + the maximum obscure IV in addition to the 28-byte ACK.
     char ack[buf_len];
     int ack_len = g_fecraw_telemetry.build_ack(ack, sizeof(ack));
     if (ack_len > 0)
@@ -86,9 +92,6 @@ static inline bool fecraw_process_wire_input(conn_info_t &conn_info,
     return true;
 }
 
-// Flush a delayed ACK when the packet-count trigger did not fire. Both event
-// loops run this on a 10ms timer so a sparse interactive exchange never waits
-// for the 400ms connection timer before producing RTT feedback.
 static inline void fecraw_flush_wire_feedback(dest_t &feedback_dest) {
     if (!g_fecraw_telemetry.enabled()) return;
     char ack[buf_len];

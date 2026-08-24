@@ -4,21 +4,11 @@
 /*
  * Erasure-aware BBR-lite pacer.
  *
- * The controller consumes protocol-v2 telemetry feedback for packets this
- * endpoint actually sent. The delivered-rate estimate is compensated only for
- * a trusted rate-independent erasure floor; excess loss and burst growth are
- * treated as congestion instead of being coded around.
- *
- * Liveness rule: pacing is fail-open. Before we have a real RTT + delivery-rate
- * sample, packets bypass the delay queue completely. If feedback later goes
- * stale, the pacing epoch is reset and traffic bypasses the queue again until a
- * fresh sample arrives. This prevents the libev timer queue from becoming part
- * of the feedback bootstrap dependency.
- *
- * Once feedback is live, reserve_delay_us() is deliberately non-blocking. It
- * assigns a wire send time and returns immediately; packet.cpp places the
- * already-framed packet into UDPspeeder's existing delay_manager. ACK handling
- * therefore remains runnable while the sender is rate-limited.
+ * Liveness rule: pacing is fail-open. Packets bypass the delay queue until
+ * telemetry has produced two real delivery-rate samples. A cached/stale rate
+ * carried on an ACK is not a sample and cannot advance STARTUP. If feedback
+ * later goes stale, the bandwidth epoch is discarded and traffic returns to
+ * direct send until the model is rebuilt.
  */
 
 #include "telemetry.h"
@@ -46,14 +36,14 @@ static const double  BBR_PROBE_BW_GAINS[] = {1.20, 0.85, 1.0, 1.0, 1.0, 1.0, 1.0
 struct pacing_t {
     pthread_mutex_t mu;
 
-    int64_t max_wire_bw;       // bytes/s, compensated for trusted erasure
+    int64_t max_wire_bw;
     double min_rtt_s;
     double smoothed_rtt_s;
     volatile int64_t bytes_in_flight;
     int64_t cwnd;
     int64_t pacing_rate;
-    int64_t max_bandwidth;     // bytes/s hard cap after feedback bootstrap
-    double next_send_s;        // reserved wire time for the next data packet
+    int64_t max_bandwidth;     // bytes/s hard cap; 0 means unlimited
+    double next_send_s;
 
     bbr_state_t state;
     int cycle_idx;
@@ -63,8 +53,6 @@ struct pacing_t {
     double congestion_scale;
     bool enabled;
 
-    // Cold-start / liveness state. No packet enters delay_manager until a real
-    // feedback sample has established both RTT and delivered rate.
     bool feedback_ready;
     int feedback_samples;
     double last_feedback_s;
@@ -85,8 +73,6 @@ struct pacing_t {
         smoothed_rtt_s = 0;
         bytes_in_flight = 0;
         cwnd = BBR_INIT_CWND;
-        // Deliberately zero during bootstrap. max_bandwidth is enforced once
-        // telemetry has established a pacing epoch; bootstrap itself is direct.
         pacing_rate = 0;
         max_bandwidth = max_bw_limit;
         next_send_s = now_s();
@@ -108,8 +94,6 @@ struct pacing_t {
 
     bool has_feedback() const { return feedback_ready; }
 
-    // Reserve this many bytes in the aggregate sender and return how long the
-    // caller should defer the packet. This never sleeps or waits for cwnd.
     uint64_t reserve_delay_us(int size) {
         if (!enabled || size <= 0) return 0;
         pthread_mutex_lock(&mu);
@@ -118,14 +102,11 @@ struct pacing_t {
         maybe_fail_open(now);
         bytes_in_flight += size;
 
-        // Critical cold-start behavior: do not enqueue before real feedback.
         if (!feedback_ready || pacing_rate <= 0) {
             pthread_mutex_unlock(&mu);
             return 0;
         }
 
-        // If userspace/timer scheduling fell behind far enough to build a long
-        // queue, discard the stale schedule rather than amplifying the stall.
         double queue_guard = 0.100;
         if (smoothed_rtt_s > 0)
             queue_guard = std::max(0.050, std::min(0.500, smoothed_rtt_s * 2.0));
@@ -153,7 +134,7 @@ struct pacing_t {
 
     void on_feedback(uint64_t acked_bytes, uint64_t decided_bytes,
                      double rtt_s, double delivered_rate,
-                     const loss_snapshot_t &loss) {
+                     bool delivery_sampled, const loss_snapshot_t &loss) {
         if (!enabled) return;
         pthread_mutex_lock(&mu);
 
@@ -171,7 +152,10 @@ struct pacing_t {
             else smoothed_rtt_s = smoothed_rtt_s * 0.875 + rtt_s * 0.125;
         }
 
-        if (delivered_rate > 0 && acked_bytes > 0) {
+        // Only a newly measured ACK/send slope is a BBR bandwidth sample.
+        // Reusing the cached delivery_rate on every ACK used to turn one low
+        // observation into three apparent no-growth rounds and leave STARTUP.
+        if (delivery_sampled && delivered_rate > 0 && acked_bytes > 0) {
             double arrival = 1.0;
             if (loss.floor_trusted) {
                 arrival = 1.0 - loss.floor;
@@ -185,10 +169,12 @@ struct pacing_t {
                 if (bw_samples[i] > max_wire_bw) max_wire_bw = bw_samples[i];
 
             ++feedback_samples;
-            if (!feedback_ready && smoothed_rtt_s > 0 && max_wire_bw > 0) {
+            // Two independent slope samples cost only one extra ACK interval
+            // on a bulk flow and prevent one anomalous first point from closing
+            // the fail-open bootstrap around a false low rate.
+            if (!feedback_ready && feedback_samples >= 2 &&
+                smoothed_rtt_s > 0 && max_wire_bw > 0) {
                 feedback_ready = true;
-                // Start the pacing timeline at this instant. Never inherit a
-                // timestamp accumulated during the feedback-free period.
                 next_send_s = now;
                 bytes_in_flight = 0;
             }
@@ -207,19 +193,21 @@ struct pacing_t {
             } else if (state == BBR_PROBE_BW) {
                 cycle_idx = (cycle_idx + 1) % 8;
             }
+
+            // Loss state changes much more slowly than ACK callbacks. Apply it
+            // at the same cadence as real delivery samples so one snapshot is
+            // not multiplied into many congestion reductions.
+            if (loss.congestive > 0.02 || loss.burst_factor > 1.6) {
+                congestion_scale *= 0.85;
+                if (congestion_scale < 0.50) congestion_scale = 0.50;
+            } else {
+                congestion_scale *= 1.02;
+                if (congestion_scale > 1.0) congestion_scale = 1.0;
+            }
         }
 
-        // A trusted floor is not congestion. Only excess loss / burst growth
-        // trims the aggregate wire rate. Recover slowly after the queue clears.
-        if (loss.congestive > 0.02 || loss.burst_factor > 1.6) {
-            congestion_scale *= 0.85;
-            if (congestion_scale < 0.50) congestion_scale = 0.50;
-        } else {
-            congestion_scale *= 1.02;
-            if (congestion_scale > 1.0) congestion_scale = 1.0;
-        }
-
-        if (state != BBR_STARTUP && min_rtt_s < 1e8 && now - last_probe_rtt > 10.0) {
+        if (feedback_ready && state != BBR_STARTUP && min_rtt_s < 1e8 &&
+            now - last_probe_rtt > 10.0) {
             state = BBR_PROBE_RTT;
             last_probe_rtt = now;
         } else if (state == BBR_PROBE_RTT && now - last_probe_rtt > 0.20) {
@@ -253,6 +241,10 @@ private:
         cycle_idx = 0;
         plateau_samples = 0;
         last_growth_bw = 0;
+        max_wire_bw = 0;
+        bw_sample_idx = 0;
+        std::memset(bw_samples, 0, sizeof(bw_samples));
+        congestion_scale = 1.0;
     }
 
     int64_t bdp() const {

@@ -2,29 +2,36 @@
 #define FECRAW_ADAPTIVE_FEC_H_
 
 /*
- * Erasure-aware RS planner.
+ * Erasure-aware redundancy planner.
  *
- * The previous controller derived "loss" from FEC decoder input/output counts,
- * which mixed parity with actual channel loss and also adjusted the opposite
- * direction. This planner consumes protocol-v2 sender feedback instead. It
- * sizes parity only from a trusted rate-independent erasure floor and leaves
- * excess/bursty loss to congestion control.
+ * RS and sliding-window RLNC intentionally use different rate questions:
+ * - recommend() sizes a sealed RS block.
+ * - recommend_window_rate() sizes continuous repairs/source for RLNC using
+ *   Queqiao's empirically calibrated window-chaining model.
  */
 
 #include "telemetry.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <pthread.h>
 #include <time.h>
 
 struct adaptive_fec_t {
+    // Compatibility pair consumed by the existing RLNC sender call site. It is
+    // initially the configured x:y pair; once WindowRate is known it becomes a
+    // fixed-point representation (1,000,000 : rate*1,000,000). RS state lives
+    // separately below so the two codecs cannot overwrite one another.
     int data_shards;
     int parity_shards;
+
+    int rs_data_shards;
+    int rs_parity_shards;
     int base_parity;
     int max_parity;
+    double window_rate;
     double last_adjust_time;
+    double last_window_adjust_time;
     pthread_mutex_t mu;
 
     static double now_sec() {
@@ -34,19 +41,30 @@ struct adaptive_fec_t {
     }
 
     void init(int data, int parity) {
-        data_shards = std::max(data, 1);
-        parity_shards = std::max(parity, 0);
-        base_parity = parity_shards;
-        // Match Queqiao's minimum code-rate guard (1/8) while staying below
-        // the GF(256) shard ceiling used by the inherited RS implementation.
-        max_parity = std::min(data_shards * 7, 254 - data_shards);
+        rs_data_shards = std::max(data, 1);
+        rs_parity_shards = std::max(parity, 0);
+        base_parity = rs_parity_shards;
+        max_parity = std::min(rs_data_shards * 7, 254 - rs_data_shards);
         if (max_parity < 0) max_parity = 0;
-        if (parity_shards > max_parity) parity_shards = max_parity;
+        if (rs_parity_shards > max_parity) rs_parity_shards = max_parity;
+
+        data_shards = rs_data_shards;
+        parity_shards = rs_parity_shards;
+        window_rate = (double)parity_shards / (double)data_shards;
         last_adjust_time = 0;
+        last_window_adjust_time = 0;
         pthread_mutex_init(&mu, NULL);
     }
 
     void destroy() { pthread_mutex_destroy(&mu); }
+
+    static double target_residual_for_rtt(double rtt_s) {
+        double target = 0.01;
+        if (rtt_s > 0.25) target = 0.003;
+        else if (rtt_s > 0.10) target = 0.006;
+        else if (rtt_s > 0 && rtt_s < 0.04) target = 0.02;
+        return target;
+    }
 
     static double binomial_tail_below(int n, double q, int k) {
         if (k <= 0) return 0;
@@ -72,27 +90,54 @@ struct adaptive_fec_t {
         if (loss < 0.005) return 0;
         if (loss >= 0.85) return max_parity;
 
-        // Long RTT makes a residual loss more expensive because the inner TCP
-        // recovery costs a WAN RTT. Keep a non-zero target: parity beyond this
-        // point grows geometrically and residual loss is what TCP is good at.
-        double target_residual = 0.01;
-        if (rtt_s > 0.25) target_residual = 0.003;
-        else if (rtt_s > 0.10) target_residual = 0.006;
-        else if (rtt_s > 0 && rtt_s < 0.04) target_residual = 0.02;
-
+        double target_residual = target_residual_for_rtt(rtt_s);
         double arrival = 1.0 - loss;
         for (int parity = 0; parity <= max_parity; ++parity) {
-            int n = data_shards + parity;
-            double residual = binomial_tail_below(n, arrival, data_shards);
+            int n = rs_data_shards + parity;
+            double residual = binomial_tail_below(n, arrival, rs_data_shards);
             if (residual <= target_residual) return parity;
         }
         return max_parity;
     }
 
-    bool adjust(const loss_snapshot_t &s, double rtt_s, int &out_data, int &out_parity) {
+    double recommend_window_rate(int capacity, const loss_snapshot_t &s,
+                                 double rtt_s) const {
+        if (capacity < 1) return 0;
+        if (!s.floor_trusted)
+            return (double)base_parity / (double)rs_data_shards;
+
+        double loss = s.floor;
+        if (loss < 0.005) return 0;
+        double arrival = 1.0 - loss;
+        if (arrival <= 0) return 8.0;
+
+        const double window_chaining = 2.5;
+        const double max_window_rate = 8.0;
+        const double target_residual = target_residual_for_rtt(rtt_s);
+        int effective = (int)((double)capacity * window_chaining);
+        if (effective < 1) effective = 1;
+
+        int lo = effective;
+        int hi = (int)((double)effective / arrival * max_window_rate);
+        if (hi < lo) hi = lo;
+        if (binomial_tail_below(hi, arrival, effective) > target_residual)
+            return max_window_rate;
+
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (binomial_tail_below(mid, arrival, effective) <= target_residual)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        return (double)(lo - effective) / (double)effective;
+    }
+
+    bool adjust(const loss_snapshot_t &s, double rtt_s,
+                int &out_data, int &out_parity) {
         pthread_mutex_lock(&mu);
-        out_data = data_shards;
-        out_parity = parity_shards;
+        out_data = rs_data_shards;
+        out_parity = rs_parity_shards;
 
         if (!s.floor_trusted || s.decided < 100) {
             pthread_mutex_unlock(&mu);
@@ -106,23 +151,57 @@ struct adaptive_fec_t {
         }
 
         int target = recommend(s, rtt_s);
-        int old = parity_shards;
-
-        // Rise quickly enough to become useful on a 40% erasure path, but do
-        // not jump from a clean-path code to the final rate in one feedback.
-        if (target > parity_shards) {
-            int step = std::max(1, (target - parity_shards + 1) / 2);
-            parity_shards = std::min(target, parity_shards + step);
-        } else if (target < parity_shards) {
-            parity_shards -= 1;
+        int old = rs_parity_shards;
+        if (target > rs_parity_shards) {
+            int step = std::max(1, (target - rs_parity_shards + 1) / 2);
+            rs_parity_shards = std::min(target, rs_parity_shards + step);
+        } else if (target < rs_parity_shards) {
+            rs_parity_shards -= 1;
         }
 
-        if (parity_shards < 0) parity_shards = 0;
-        if (parity_shards > max_parity) parity_shards = max_parity;
+        if (rs_parity_shards < 0) rs_parity_shards = 0;
+        if (rs_parity_shards > max_parity) rs_parity_shards = max_parity;
         last_adjust_time = now;
-        out_parity = parity_shards;
+        out_parity = rs_parity_shards;
         pthread_mutex_unlock(&mu);
-        return old != parity_shards;
+        return old != rs_parity_shards;
+    }
+
+    bool adjust_window_rate(int capacity, const loss_snapshot_t &s,
+                            double rtt_s, double &out_rate) {
+        pthread_mutex_lock(&mu);
+        out_rate = window_rate;
+        if (!s.floor_trusted || s.decided < 100) {
+            pthread_mutex_unlock(&mu);
+            return false;
+        }
+
+        double now = now_sec();
+        if (last_window_adjust_time > 0 && now - last_window_adjust_time < 1.0) {
+            pthread_mutex_unlock(&mu);
+            return false;
+        }
+
+        double target = recommend_window_rate(capacity, s, rtt_s);
+        bool changed = std::fabs(target - window_rate) > 1e-9;
+        window_rate = target;
+        last_window_adjust_time = now;
+
+        const int scale = 1000000;
+        data_shards = scale;
+        parity_shards = (int)(window_rate * scale + 0.5);
+        if (parity_shards < 0) parity_shards = 0;
+        if (parity_shards > 8 * scale) parity_shards = 8 * scale;
+        out_rate = window_rate;
+        pthread_mutex_unlock(&mu);
+        return changed;
+    }
+
+    double get_window_rate() {
+        pthread_mutex_lock(&mu);
+        double out = window_rate;
+        pthread_mutex_unlock(&mu);
+        return out;
     }
 };
 

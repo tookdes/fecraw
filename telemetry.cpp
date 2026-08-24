@@ -27,6 +27,7 @@ void telemetry_link_t::init(bool enabled) {
     tx_next_ = 1;
     next_decide_ = 1;
     for (int i = 0; i < kSentRing; ++i) sent_[i] = sent_slot_t();
+    total_sent_bytes_ = 0;
 
     rx_started_ = false;
     rx_largest_ = 0;
@@ -48,8 +49,12 @@ void telemetry_link_t::init(bool enabled) {
     min_rtt_s_ = 1e9;
     srtt_s_ = 0;
     delivery_rate_ = 0;
-    rate_epoch_ = now_s();
-    rate_acked_bytes_ = 0;
+    rate_started_ = false;
+    delivered_bytes_ = 0;
+    last_ack_point_time_ = 0;
+    last_ack_point_delivered_ = 0;
+    last_ack_point_sent_time_ = 0;
+    last_ack_point_sent_bytes_ = 0;
 }
 
 double telemetry_link_t::now_s() {
@@ -99,6 +104,8 @@ void telemetry_link_t::commit_sent(uint64_t seq, int bytes, double send_after_s)
     s.seq = seq;
     s.sent_at = now_s() + send_after_s;
     s.bytes = bytes;
+    if (bytes > 0) total_sent_bytes_ += (uint64_t)bytes;
+    s.sent_total = total_sent_bytes_;
     s.valid = true;
     s.acked = false;
 }
@@ -232,11 +239,6 @@ void telemetry_link_t::refresh_floor_trust() {
         return;
     }
 
-    // fecraw does not replace the outer connection on every physical path
-    // change. Once the old minimum has rotated out of a full eight-round
-    // window, allow a persistently memoryless higher floor to become the new
-    // baseline. Bursty queue loss fails the memoryless test and cannot ratchet
-    // this upward.
     if (rounds_count_ == 8 && s.burst_factor < 1.30 &&
         candidate > established_floor_ * 1.15)
         established_floor_ = candidate;
@@ -260,9 +262,11 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
     uint64_t decided_bytes = 0;
     double best_rtt = 0;
 
-    // Positive acknowledgements are sampled immediately, even if an earlier
-    // gap is still inside the reorder tolerance. This keeps RTT and delivery
-    // rate from inheriting artificial head-of-line delay from loss detection.
+    // The newest newly-acked packet anchors the send slope for this ACK point.
+    uint64_t sample_seq = 0;
+    double sample_sent_at = 0;
+    uint64_t sample_sent_total = 0;
+
     for (unsigned off = 0; off < 128 && largest >= off; ++off) {
         if (!ack_bit(mask_lo, mask_hi, off)) continue;
         uint64_t seq = largest - off;
@@ -276,6 +280,11 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
         acked_bytes += (uint64_t)std::max(slot.bytes, 0);
         double sample = now - slot.sent_at;
         if (sample > 0 && (best_rtt <= 0 || sample < best_rtt)) best_rtt = sample;
+        if (seq > sample_seq) {
+            sample_seq = seq;
+            sample_sent_at = slot.sent_at;
+            sample_sent_total = slot.sent_total;
+        }
     }
 
     while (next_decide_ <= largest) {
@@ -301,14 +310,45 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
         else srtt_s_ = srtt_s_ * 0.875 + best_rtt * 0.125;
     }
 
-    rate_acked_bytes_ += acked_bytes;
-    double elapsed = now - rate_epoch_;
-    if (elapsed >= 0.050) {
-        double sample_rate = (double)rate_acked_bytes_ / elapsed;
-        if (delivery_rate_ <= 0) delivery_rate_ = sample_rate;
-        else delivery_rate_ = std::max(sample_rate, delivery_rate_ * 0.90);
-        rate_acked_bytes_ = 0;
-        rate_epoch_ = now;
+    bool delivery_sampled = false;
+    if (acked_bytes > 0 && sample_seq != 0) {
+        delivered_bytes_ += acked_bytes;
+        if (!rate_started_) {
+            // The first ACK is a point, not a rate sample. Dividing its bytes
+            // by time since process startup (roughly one WAN RTT) was the cause
+            // of the 0.42 Mbps self-lock observed on the real Ali/GCP path.
+            rate_started_ = true;
+            last_ack_point_time_ = now;
+            last_ack_point_delivered_ = delivered_bytes_;
+            last_ack_point_sent_time_ = sample_sent_at;
+            last_ack_point_sent_bytes_ = sample_sent_total;
+        } else if (sample_sent_at > last_ack_point_sent_time_ &&
+                   sample_sent_total > last_ack_point_sent_bytes_ &&
+                   delivered_bytes_ > last_ack_point_delivered_) {
+            double ack_elapsed = now - last_ack_point_time_;
+            double send_elapsed = sample_sent_at - last_ack_point_sent_time_;
+            if (ack_elapsed > 0 && send_elapsed > 0) {
+                // Match Queqiao BBR's anti-compression sampler: ACK slope says
+                // how quickly bytes arrived, send slope says how quickly this
+                // sender actually launched the corresponding packets. Their
+                // minimum cannot be inflated by a compressed ACK train.
+                if (ack_elapsed < 0.001) ack_elapsed = 0.001;
+                if (send_elapsed < 0.001) send_elapsed = 0.001;
+                double ack_rate = (double)(delivered_bytes_ - last_ack_point_delivered_) /
+                                  ack_elapsed;
+                double send_rate = (double)(sample_sent_total - last_ack_point_sent_bytes_) /
+                                   send_elapsed;
+                double sample_rate = std::min(ack_rate, send_rate);
+                if (sample_rate > 0 && std::isfinite(sample_rate)) {
+                    delivery_rate_ = sample_rate;
+                    delivery_sampled = true;
+                }
+            }
+            last_ack_point_time_ = now;
+            last_ack_point_delivered_ = delivered_bytes_;
+            last_ack_point_sent_time_ = sample_sent_at;
+            last_ack_point_sent_bytes_ = sample_sent_total;
+        }
     }
 
     refresh_floor_trust();
@@ -318,6 +358,7 @@ void telemetry_link_t::process_ack(uint64_t largest, uint64_t mask_lo, uint64_t 
         feedback.decided_bytes = decided_bytes;
         feedback.rtt_s = best_rtt > 0 ? best_rtt : srtt_s_;
         feedback.delivery_rate = delivery_rate_;
+        feedback.delivery_sampled = delivery_sampled;
         feedback.loss = snapshot();
     }
 }

@@ -4,15 +4,9 @@
 /*
  * Sliding-window random linear erasure code for fecraw.
  *
- * The design follows Queqiao's window code rather than UDPspeeder's sealed RS
- * blocks: source symbols are transmitted immediately and repair symbols are
- * random linear combinations of the newest source window over GF(256). A
- * repair emitted now can therefore recover an older erasure without waiting
- * for a block boundary.
- *
- * This implementation is packet-oriented for the TUN data plane. Large IP
- * packets are fragmented into source symbols; each symbol carries enough
- * metadata to reassemble the original packet after recovery.
+ * Source symbols are transmitted immediately and repair symbols are random
+ * linear combinations of the newest source window over GF(256). Large IP
+ * packets are fragmented into source symbols and reassembled after recovery.
  */
 
 #include <cstdint>
@@ -25,16 +19,30 @@ public:
 
     void init(int window_size, int mtu, int data_shards, int parity_shards);
     void set_rate(int data_shards, int parity_shards);
+
+    // Continuous sliding-window repair rate (repairs/source). The underlying
+    // encoder already uses a fractional credit accumulator, so no codec or wire
+    // change is needed: represent the rate with a fixed-point x:y pair and let
+    // the existing credit mechanism emit repairs at that average.
+    void set_repair_rate(double repairs_per_source) {
+        if (repairs_per_source < 0) repairs_per_source = 0;
+        if (repairs_per_source > 8.0) repairs_per_source = 8.0;
+        const int scale = 1000000;
+        data_shards_ = scale;
+        parity_shards_ = (int)(repairs_per_source * scale + 0.5);
+    }
+
     void reset_window();
 
-    // Encode one TUN packet. frames contains source frames plus zero or more
-    // repair frames, each ready for the legacy fecraw header + my_send().
     int encode_packet(const char *packet, int len,
                       std::vector<std::vector<char> > &frames);
 
     int window_size() const { return capacity_; }
     int data_shards() const { return data_shards_; }
     int parity_shards() const { return parity_shards_; }
+    double repair_rate() const {
+        return data_shards_ > 0 ? (double)parity_shards_ / (double)data_shards_ : 0;
+    }
 
     static bool is_frame(const char *data, int len);
     static bool is_source_frame(const char *data, int len);
@@ -70,8 +78,6 @@ public:
     void init();
     void reset();
 
-    // Consume one RLNC source/repair frame. Any complete original TUN packets
-    // produced by this arrival are appended to packets.
     int receive(const char *data, int len,
                 std::vector<std::vector<char> > &packets);
 

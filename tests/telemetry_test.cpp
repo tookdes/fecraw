@@ -7,7 +7,6 @@
 #include <cstring>
 
 static bool drop_packet(unsigned seq) {
-    // Deterministic pseudo-random ~20% erasure, not a periodic burst pattern.
     unsigned x = seq * 2654435761u;
     x ^= x >> 13;
     x *= 2246822519u;
@@ -53,7 +52,6 @@ int main() {
         }
     }
 
-    // Flush the sender's reorder tolerance so earlier gaps become decided.
     for (unsigned i = 401; i <= 464; ++i) {
         char frame[256];
         uint64_t seq = 0;
@@ -85,10 +83,8 @@ int main() {
     assert(recommended > 4);
     assert(recommended <= planner.max_parity);
 
-    // Regression for the real-link zero-throughput bug: the pacer must be
-    // completely fail-open until real feedback exists. In particular, a hard
-    // max-bandwidth setting must not seed a libev timer queue before ACK/RTT
-    // feedback can itself get through.
+    // Pacing bootstrap regression. Cached delivery_rate values on ordinary ACK
+    // callbacks are not new samples and must leave the sender fail-open.
     pacing_t pacer;
     pacer.init(1000000);
     uint64_t cold_first = pacer.reserve_delay_us(1000);
@@ -104,12 +100,20 @@ int main() {
     ploss.loss = 0.10;
     ploss.memoryless = true;
     ploss.decided = 1000;
-    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, ploss);
+
+    // A stale/cached value cannot bootstrap BBR.
+    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, false, ploss);
+    assert(!pacer.has_feedback());
+    assert(pacer.reserve_delay_us(1000) == 0);
+    pacer.cancel_reserved(1000);
+
+    // One genuine slope sample is deliberately still fail-open; the second
+    // closes bootstrap and starts pacing from a model that has confirmation.
+    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, true, ploss);
+    assert(!pacer.has_feedback());
+    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, true, ploss);
     assert(pacer.has_feedback());
 
-    // Once feedback bootstraps the epoch, pacing becomes active and remains
-    // non-blocking: at the 1 MB/s cap the second 1000-byte reservation should
-    // be roughly 1ms behind the first.
     uint64_t paced_first = pacer.reserve_delay_us(1000);
     uint64_t paced_second = pacer.reserve_delay_us(1000);
     assert(paced_first < 10000);
