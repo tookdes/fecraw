@@ -35,6 +35,8 @@ static small_packet_receiver_t g_sp_recv;
 static window_rlnc_sender_t g_rlnc_send;
 static window_rlnc_receiver_t g_rlnc_recv;
 static int g_tx_codec = FECRAW_CODEC_RS;
+static double g_rlnc_last_activity_s = 0;
+static const double kRlncTailIdleS = 0.005;
 
 static void *raw_thread_func(void *arg) {
     int fd = *(int *)arg;
@@ -56,15 +58,8 @@ static int choose_tx_codec() {
     return FECRAW_CODEC_RS;
 }
 
-static void send_rlnc_packet(char *data, int len, char header) {
-    if (g_cfg.fec_adaptive)
-        g_rlnc_send.set_rate(g_adaptive.data_shards, g_adaptive.parity_shards);
-
-    std::vector<std::vector<char> > frames;
-    if (g_rlnc_send.encode_packet(data, len, frames) != 0) {
-        mylog(log_warn, "client RLNC encode failed len=%d\n", len);
-        return;
-    }
+static void send_rlnc_frames(const std::vector<std::vector<char> > &frames,
+                             char header) {
     for (size_t i = 0; i < frames.size(); ++i) {
         if (frames[i].size() + 1 >= (size_t)buf_len) {
             mylog(log_warn, "client RLNC frame too large: %d\n", (int)frames[i].size());
@@ -78,15 +73,74 @@ static void send_rlnc_packet(char *data, int len, char header) {
     }
 }
 
+static void flush_rlnc_tail(char header, bool force = false) {
+    if (!g_cfg.fec_adaptive) return;
+
+    int symbols = g_rlnc_send.pending_burst_symbols();
+    if (symbols <= 0) {
+        g_rlnc_last_activity_s = 0;
+        return;
+    }
+
+    double now = pacing_t::now_s();
+    if (!force && (g_rlnc_last_activity_s <= 0 ||
+                   now - g_rlnc_last_activity_s < kRlncTailIdleS))
+        return;
+
+    loss_snapshot_t s = g_fecraw_telemetry.snapshot();
+    double rtt = g_fecraw_telemetry.smoothed_rtt_s();
+    int want = adaptive_fec_t::recommend_tail_repairs(symbols, s, rtt);
+    if (want < 0) return;
+
+    int have = g_rlnc_send.pending_burst_repairs();
+    std::vector<std::vector<char> > frames;
+    int added = g_rlnc_send.protect_burst(want, frames);
+    if (added < 0) {
+        mylog(log_warn, "client RLNC tail protection failed symbols=%d want=%d\n",
+              symbols, want);
+        return;
+    }
+    send_rlnc_frames(frames, header);
+    g_rlnc_last_activity_s = 0;
+
+    if (added > 0) {
+        static double last_report = 0;
+        if (last_report <= 0 || now - last_report >= 1.0) {
+            last_report = now;
+            mylog(log_info,
+                  "[client] RLNC tail protect symbols=%d have=%d want=%d added=%d floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
+                  symbols, have, want, added,
+                  s.floor_trusted ? s.floor : 0.0, s.loss, s.burst_factor,
+                  rtt * 1000.0);
+        }
+    }
+}
+
+static void send_rlnc_packet(char *data, int len, char header) {
+    if (g_cfg.fec_adaptive)
+        g_rlnc_send.set_rate(g_adaptive.data_shards, g_adaptive.parity_shards);
+
+    std::vector<std::vector<char> > frames;
+    if (g_rlnc_send.encode_packet(data, len, frames) != 0) {
+        mylog(log_warn, "client RLNC encode failed len=%d\n", len);
+        return;
+    }
+    send_rlnc_frames(frames, header);
+    g_rlnc_last_activity_s = pacing_t::now_s();
+}
+
 static void send_data_packet(conn_info_t &conn_info, char *data, int len, char header) {
     int desired = choose_tx_codec();
     if (desired != g_tx_codec) {
         // RS may have a partially-filled sealed block. Flush it before changing
-        // formats; RLNC has no sealed block, so leaving it only drops history.
-        if (g_tx_codec == FECRAW_CODEC_RS)
+        // formats. Seal an RLNC tail before discarding its retained equations.
+        if (g_tx_codec == FECRAW_CODEC_RS) {
             from_normal_to_fec2(conn_info, raw_dest, 0, 0, header);
-        else
+        } else {
+            flush_rlnc_tail(header, true);
             g_rlnc_send.reset_window();
+            g_rlnc_last_activity_s = 0;
+        }
         g_tx_codec = desired;
         mylog(log_info, "[client] tx codec -> %s\n", fecraw_codec_name(g_tx_codec));
     }
@@ -237,6 +291,10 @@ static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int re
 
 static void feedback_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
     (void)loop; (void)watcher; (void)revents;
+    if (g_tx_codec == FECRAW_CODEC_RLNC) {
+        char header = got_feed_back ? header_normal : header_new_connect;
+        flush_rlnc_tail(header);
+    }
     fecraw_flush_wire_feedback(raw_dest);
 }
 

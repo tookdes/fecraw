@@ -26,17 +26,17 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
                                     fb.rtt_s, fb.delivery_rate,
                                     fb.delivery_sampled, fb.loss);
 
-        // Real-link pacing failures are impossible to diagnose from final
-        // goodput alone. Report only genuine ACK/send-slope samples, at most
-        // once per second, so WAN A/B tests expose whether a low rate came from
-        // the sampler, the erasure compensation, or the BBR-lite state machine.
+        // Report only genuine ACK/send-slope samples, at most once per second.
+        // Stage 4 also exposes the two independent loss-model dimensions and
+        // congestion scale: burst correlation is an FEC sizing input, while
+        // only excess loss above the trusted erasure floor may reduce pacing.
         if (fb.delivery_sampled) {
             static double last_pacing_report = 0;
             double now = pacing_t::now_s();
             if (last_pacing_report <= 0 || now - last_pacing_report >= 1.0) {
                 last_pacing_report = now;
                 mylog(log_info,
-                      "[%s] pacing sample delivered=%.3fMbps wire_bw=%.3fMbps rate=%.3fMbps state=%s ready=%d floor=%.3f rtt=%.1fms\n",
+                      "[%s] pacing sample delivered=%.3fMbps wire_bw=%.3fMbps rate=%.3fMbps state=%s ready=%d floor=%.3f recent=%.3f cong=%.3f burst=%.2f scale=%.2f rtt=%.1fms\n",
                       role,
                       fb.delivery_rate * 8.0 / 1000000.0,
                       (double)g_fecraw_pacing.max_wire_bw * 8.0 / 1000000.0,
@@ -44,6 +44,10 @@ static inline void fecraw_apply_feedback(conn_info_t &conn_info,
                       g_fecraw_pacing.state_name(),
                       g_fecraw_pacing.has_feedback() ? 1 : 0,
                       fb.loss.floor_trusted ? fb.loss.floor : 0.0,
+                      fb.loss.recent,
+                      fb.loss.congestive,
+                      fb.loss.burst_factor,
+                      g_fecraw_pacing.congestion_scale,
                       fb.rtt_s * 1000.0);
             }
         }
