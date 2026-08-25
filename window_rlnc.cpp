@@ -139,7 +139,7 @@ static bool magic_ok(const char *data, int len) {
 window_rlnc_sender_t::window_rlnc_sender_t()
     : capacity_(64), mtu_(1250), data_shards_(20), parity_shards_(10),
       next_esi_(0), next_rid_(1), next_packet_id_(1), held_(0),
-      repair_credit_(0) {}
+      repair_credit_(0), burst_symbols_(0), burst_repairs_(0) {}
 
 void window_rlnc_sender_t::init(int window_size, int mtu,
                                 int data_shards, int parity_shards) {
@@ -150,6 +150,8 @@ void window_rlnc_sender_t::init(int window_size, int mtu,
     next_packet_id_ = 1;
     held_ = 0;
     repair_credit_ = 0;
+    burst_symbols_ = 0;
+    burst_repairs_ = 0;
     ring_.assign((size_t)capacity_, source_slot_t());
     set_rate(data_shards, parity_shards);
 }
@@ -166,6 +168,8 @@ void window_rlnc_sender_t::reset_window() {
     }
     held_ = 0;
     repair_credit_ = 0;
+    burst_symbols_ = 0;
+    burst_repairs_ = 0;
 }
 
 bool window_rlnc_sender_t::is_frame(const char *data, int len) {
@@ -192,9 +196,11 @@ uint32_t window_rlnc_sender_t::add_source(const std::vector<unsigned char> &vect
     return esi;
 }
 
-bool window_rlnc_sender_t::build_repair(std::vector<char> &frame) {
+bool window_rlnc_sender_t::build_repair(std::vector<char> &frame, int count_limit) {
     if (held_ <= 0 || ring_.empty()) return false;
     int count = std::min(held_, capacity_);
+    if (count_limit > 0) count = std::min(count, count_limit);
+    if (count <= 0) return false;
     uint32_t first = next_esi_ - (uint32_t)count;
 
     size_t vector_len = 0;
@@ -222,6 +228,27 @@ bool window_rlnc_sender_t::build_repair(std::vector<char> &frame) {
     put_u32(&frame[12], first);
     std::memcpy(&frame[kRepairHeader], &repair[0], repair.size());
     return true;
+}
+
+int window_rlnc_sender_t::protect_burst(
+        int desired_total_repairs,
+        std::vector<std::vector<char> > &frames) {
+    frames.clear();
+    if (burst_symbols_ <= 0) return 0;
+    if (desired_total_repairs < 0) return -1;
+
+    while (burst_repairs_ < desired_total_repairs) {
+        std::vector<char> repair;
+        if (!build_repair(repair, burst_symbols_)) return -1;
+        frames.push_back(repair);
+        ++burst_repairs_;
+    }
+
+    int added = (int)frames.size();
+    burst_symbols_ = 0;
+    burst_repairs_ = 0;
+    repair_credit_ = 0;
+    return added;
 }
 
 int window_rlnc_sender_t::encode_packet(const char *packet, int len,
@@ -268,12 +295,22 @@ int window_rlnc_sender_t::encode_packet(const char *packet, int len,
         std::memcpy(&source[kSourceHeader], &vector[0], vector.size());
         frames.push_back(source);
 
+        ++burst_symbols_;
         repair_credit_ += (double)parity_shards_ / (double)data_shards_;
         while (repair_credit_ + 1e-12 >= 1.0) {
             std::vector<char> repair;
             if (!build_repair(repair)) break;
             frames.push_back(repair);
             repair_credit_ -= 1.0;
+            ++burst_repairs_;
+        }
+
+        // Once a complete RLNC window has flowed at the steady-state rate it
+        // needs no special tail treatment. Only the suffix after this point is
+        // vulnerable to producer drain, so begin a fresh burst accounting era.
+        if (burst_symbols_ >= capacity_) {
+            burst_symbols_ = 0;
+            burst_repairs_ = 0;
         }
     }
     return 0;

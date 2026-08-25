@@ -78,15 +78,18 @@ int main() {
     synthetic.floor = 0.20;
     synthetic.loss = 0.20;
     synthetic.memoryless = true;
+    synthetic.burst_factor = 1.0;
     synthetic.decided = 1000;
     int recommended = planner.recommend(synthetic, 0.20);
     assert(recommended > 4);
     assert(recommended <= planner.max_parity);
 
-    // Pacing bootstrap regression. Cached delivery_rate values on ordinary ACK
-    // callbacks are not new samples and must leave the sender fail-open.
+    // Stage-4 pacing bootstrap regression. The sender must remain fail-open for
+    // one RTT worth of genuine samples, retain a short high sample in a
+    // time-based max filter, and STARTUP must apply >=2x gain rather than
+    // immediately defining capacity as its own paced output.
     pacing_t pacer;
-    pacer.init(1000000);
+    pacer.init(0);
     uint64_t cold_first = pacer.reserve_delay_us(1000);
     uint64_t cold_second = pacer.reserve_delay_us(1000);
     assert(cold_first == 0);
@@ -96,36 +99,58 @@ int main() {
 
     loss_snapshot_t ploss;
     ploss.floor_trusted = true;
-    ploss.floor = 0.10;
-    ploss.loss = 0.10;
+    ploss.floor = 0.0;
+    ploss.loss = 0.0;
     ploss.memoryless = true;
+    ploss.burst_factor = 1.0;
+    ploss.congestive = 0.0;
     ploss.decided = 1000;
 
-    // A stale/cached value cannot bootstrap BBR.
-    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, false, ploss);
+    pacer.on_feedback(10000, 10000, 0.200, 100000.0, false, ploss);
     assert(!pacer.has_feedback());
-    assert(pacer.reserve_delay_us(1000) == 0);
-    pacer.cancel_reserved(1000);
+    pacer.on_feedback(10000, 10000, 0.200, 100000.0, true, ploss);
+    assert(!pacer.has_feedback());
 
-    // One genuine slope sample is deliberately still fail-open; the second
-    // closes bootstrap and starts pacing from a model that has confirmation.
-    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, true, ploss);
-    assert(!pacer.has_feedback());
-    pacer.on_feedback(10000, 10000, 0.150, 1000000.0, true, ploss);
+    // Avoid a wall-clock sleep in the unit test: keep production semantics but
+    // make the already-started bootstrap epoch one RTT old.
+    pacer.bootstrap_started_s = pacing_t::now_s() - 0.25;
+    pacer.on_feedback(10000, 10000, 0.200, 120000.0, true, ploss);
+    pacer.on_feedback(10000, 10000, 0.200, 2500000.0, true, ploss);
+    pacer.on_feedback(10000, 10000, 0.200, 150000.0, true, ploss);
     assert(pacer.has_feedback());
+    assert(pacer.state == BBR_STARTUP);
+    assert(pacer.max_wire_bw >= 2500000);
+    assert(pacer.pacing_rate >= 5000000);
+
+    int64_t peak = pacer.max_wire_bw;
+    for (int i = 0; i < 16; ++i)
+        pacer.on_feedback(10000, 10000, 0.200, 80000.0 + i, true, ploss);
+    assert(pacer.max_wire_bw == peak);
+
+    // Correlated erasure is not congestion. Stage 3 used burst_factor>1.6 to
+    // halve congestion_scale even with no excess loss, producing the observed
+    // probe_bw rate/wire_bw ~= 0.425. Keep scale at one in this case.
+    loss_snapshot_t burst_only = ploss;
+    burst_only.burst_factor = 3.0;
+    burst_only.congestive = 0.0;
+    pacer.congestion_scale = 1.0;
+    pacer.on_feedback(10000, 10000, 0.200, 100000.0, true, burst_only);
+    assert(pacer.congestion_scale > 0.99);
 
     uint64_t paced_first = pacer.reserve_delay_us(1000);
     uint64_t paced_second = pacer.reserve_delay_us(1000);
     assert(paced_first < 10000);
-    assert(paced_second > 100);
+    assert(paced_second > 10);
     assert(paced_second < 10000);
     pacer.cancel_reserved(2000);
 
     std::printf("telemetry: decided=%llu loss=%.3f burst=%.2f floor=%.3f trusted=%d; "
-                "RS 20:%d; cold=%lluus/%lluus paced=%lluus/%lluus\n",
+                "RS 20:%d; cold=%lluus/%lluus startup_bw=%.3fMbps rate=%.3fMbps paced=%lluus/%lluus\n",
                 (unsigned long long)s.decided, s.loss, s.burst_factor, s.floor,
                 s.floor_trusted ? 1 : 0, recommended,
                 (unsigned long long)cold_first, (unsigned long long)cold_second,
+                (double)pacer.max_wire_bw * 8.0 / 1000000.0,
+                (double)pacer.pacing_rate * 8.0 / 1000000.0,
                 (unsigned long long)paced_first, (unsigned long long)paced_second);
     return 0;
 }

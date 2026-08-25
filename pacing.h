@@ -4,11 +4,12 @@
 /*
  * Erasure-aware BBR-lite pacer.
  *
- * Liveness rule: pacing is fail-open. Packets bypass the delay queue until
- * telemetry has produced two real delivery-rate samples. A cached/stale rate
- * carried on an ACK is not a sample and cannot advance STARTUP. If feedback
- * later goes stale, the bandwidth epoch is discarded and traffic returns to
- * direct send until the model is rebuilt.
+ * Liveness rule: pacing is fail-open. A sender remains uncapped long enough to
+ * observe one RTT of genuine delivery samples before it closes bootstrap. The
+ * bandwidth estimate is a time-windowed max rather than a handful of ACK
+ * samples, so pacing its own output down cannot immediately redefine path
+ * capacity downward. STARTUP and PROBE_BW advance on RTT-scale rounds, not on
+ * individual ACK callbacks.
  */
 
 #include "telemetry.h"
@@ -32,6 +33,8 @@ static const int64_t BBR_INIT_CWND = 64 * 1024;
 static const int64_t BBR_MIN_CWND = 16 * 1024;
 static const int64_t BBR_PROBE_RTT_CWND = 4 * 1500;
 static const double  BBR_PROBE_BW_GAINS[] = {1.20, 0.85, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+static const int     BBR_BW_BUCKETS = 32;
+static const double  BBR_BW_BUCKET_S = 0.25; // eight-second max filter
 
 struct pacing_t {
     pthread_mutex_t mu;
@@ -47,18 +50,24 @@ struct pacing_t {
 
     bbr_state_t state;
     int cycle_idx;
-    int plateau_samples;
-    int64_t last_growth_bw;
+    int full_bw_rounds;
+    int64_t full_bw;
+    int64_t startup_round_bw;
+    double startup_round_started_s;
+    double state_started_s;
+    double probe_cycle_started_s;
     double last_probe_rtt;
     double congestion_scale;
     bool enabled;
 
     bool feedback_ready;
     int feedback_samples;
+    double bootstrap_started_s;
     double last_feedback_s;
 
-    int64_t bw_samples[10];
-    int bw_sample_idx;
+    int64_t bw_buckets[BBR_BW_BUCKETS];
+    int bw_bucket_idx;
+    double bw_bucket_started_s;
 
     static double now_s() {
         struct timespec ts;
@@ -78,16 +87,22 @@ struct pacing_t {
         next_send_s = now_s();
         state = BBR_STARTUP;
         cycle_idx = 0;
-        plateau_samples = 0;
-        last_growth_bw = 0;
+        full_bw_rounds = 0;
+        full_bw = 0;
+        startup_round_bw = 0;
+        startup_round_started_s = 0;
+        state_started_s = next_send_s;
+        probe_cycle_started_s = next_send_s;
         last_probe_rtt = next_send_s;
         congestion_scale = 1.0;
         enabled = true;
         feedback_ready = false;
         feedback_samples = 0;
+        bootstrap_started_s = 0;
         last_feedback_s = 0;
-        std::memset(bw_samples, 0, sizeof(bw_samples));
-        bw_sample_idx = 0;
+        std::memset(bw_buckets, 0, sizeof(bw_buckets));
+        bw_bucket_idx = 0;
+        bw_bucket_started_s = 0;
     }
 
     void destroy() { pthread_mutex_destroy(&mu); }
@@ -152,9 +167,8 @@ struct pacing_t {
             else smoothed_rtt_s = smoothed_rtt_s * 0.875 + rtt_s * 0.125;
         }
 
-        // Only a newly measured ACK/send slope is a BBR bandwidth sample.
-        // Reusing the cached delivery_rate on every ACK used to turn one low
-        // observation into three apparent no-growth rounds and leave STARTUP.
+        rotate_bw_buckets(now);
+
         if (delivery_sampled && delivered_rate > 0 && acked_bytes > 0) {
             double arrival = 1.0;
             if (loss.floor_trusted) {
@@ -163,58 +177,46 @@ struct pacing_t {
             }
             int64_t wire_sample = (int64_t)(delivered_rate / arrival);
             if (wire_sample < 1) wire_sample = 1;
-            bw_samples[bw_sample_idx++ % 10] = wire_sample;
-            max_wire_bw = 0;
-            for (int i = 0; i < 10; ++i)
-                if (bw_samples[i] > max_wire_bw) max_wire_bw = bw_samples[i];
+            record_bandwidth_sample(wire_sample, now);
 
+            if (bootstrap_started_s <= 0) bootstrap_started_s = now;
             ++feedback_samples;
-            // Two independent slope samples cost only one extra ACK interval
-            // on a bulk flow and prevent one anomalous first point from closing
-            // the fail-open bootstrap around a false low rate.
-            if (!feedback_ready && feedback_samples >= 2 &&
-                smoothed_rtt_s > 0 && max_wire_bw > 0) {
+
+            // Two samples fixed the original process-start dilution bug, but
+            // the real Ali/GCP test showed that two ACK intervals are still too
+            // little evidence: an unlucky low pair closes the pacer around its
+            // own output. Stay fail-open for one measured RTT and at least four
+            // genuine slopes so the initial max can see the unconstrained path.
+            if (!feedback_ready && feedback_samples >= 4 &&
+                smoothed_rtt_s > 0 && max_wire_bw > 0 &&
+                now - bootstrap_started_s >= bootstrap_wait_s()) {
                 feedback_ready = true;
                 next_send_s = now;
                 bytes_in_flight = 0;
+                enter_state(BBR_STARTUP, now);
+                full_bw = 0;
+                full_bw_rounds = 0;
+                startup_round_bw = wire_sample;
+                startup_round_started_s = now;
+            } else if (feedback_ready && state == BBR_STARTUP) {
+                advance_startup(wire_sample, now);
             }
 
-            if (state == BBR_STARTUP) {
-                if (last_growth_bw == 0 || wire_sample > last_growth_bw * 5 / 4) {
-                    last_growth_bw = wire_sample;
-                    plateau_samples = 0;
-                } else if (++plateau_samples >= 3) {
-                    state = BBR_DRAIN;
-                    plateau_samples = 0;
-                }
-            } else if (state == BBR_DRAIN && bytes_in_flight <= bdp()) {
-                state = BBR_PROBE_BW;
-                cycle_idx = 0;
-            } else if (state == BBR_PROBE_BW) {
-                cycle_idx = (cycle_idx + 1) % 8;
-            }
-
-            // Loss state changes much more slowly than ACK callbacks. Apply it
-            // at the same cadence as real delivery samples so one snapshot is
-            // not multiplied into many congestion reductions.
-            if (loss.congestive > 0.02 || loss.burst_factor > 1.6) {
-                congestion_scale *= 0.85;
+            // burst_factor describes correlation of erasures, not congestion.
+            // Stage 3 incorrectly used burst_factor>1.6 as a congestion signal;
+            // the real E2 rate/wire_bw ~= 0.425 is exactly 0.85 probe gain times
+            // the resulting 0.5 scale. Only excess loss above a trusted floor
+            // is allowed to reduce the sending rate here.
+            if (loss.floor_trusted && loss.congestive > 0.02) {
+                congestion_scale *= 0.90;
                 if (congestion_scale < 0.50) congestion_scale = 0.50;
             } else {
-                congestion_scale *= 1.02;
+                congestion_scale *= 1.05;
                 if (congestion_scale > 1.0) congestion_scale = 1.0;
             }
         }
 
-        if (feedback_ready && state != BBR_STARTUP && min_rtt_s < 1e8 &&
-            now - last_probe_rtt > 10.0) {
-            state = BBR_PROBE_RTT;
-            last_probe_rtt = now;
-        } else if (state == BBR_PROBE_RTT && now - last_probe_rtt > 0.20) {
-            state = BBR_PROBE_BW;
-            cycle_idx = 0;
-        }
-
+        advance_periodic_state(now);
         update_limits();
         pthread_mutex_unlock(&mu);
     }
@@ -225,6 +227,111 @@ struct pacing_t {
     }
 
 private:
+    double control_round_s() const {
+        double rtt = min_rtt_s < 1e8 ? min_rtt_s : smoothed_rtt_s;
+        if (rtt <= 0) rtt = 0.10;
+        return std::max(0.050, std::min(0.500, rtt));
+    }
+
+    double bootstrap_wait_s() const {
+        double rtt = smoothed_rtt_s > 0 ? smoothed_rtt_s : 0.10;
+        return std::max(0.050, std::min(0.500, rtt));
+    }
+
+    void recompute_max_bw() {
+        max_wire_bw = 0;
+        for (int i = 0; i < BBR_BW_BUCKETS; ++i)
+            if (bw_buckets[i] > max_wire_bw) max_wire_bw = bw_buckets[i];
+    }
+
+    void rotate_bw_buckets(double now) {
+        if (bw_bucket_started_s <= 0) {
+            bw_bucket_started_s = now;
+            return;
+        }
+        if (now <= bw_bucket_started_s) return;
+        int steps = (int)((now - bw_bucket_started_s) / BBR_BW_BUCKET_S);
+        if (steps <= 0) return;
+        if (steps >= BBR_BW_BUCKETS) {
+            std::memset(bw_buckets, 0, sizeof(bw_buckets));
+            bw_bucket_idx = 0;
+            bw_bucket_started_s = now;
+        } else {
+            for (int i = 0; i < steps; ++i) {
+                bw_bucket_idx = (bw_bucket_idx + 1) % BBR_BW_BUCKETS;
+                bw_buckets[bw_bucket_idx] = 0;
+            }
+            bw_bucket_started_s += (double)steps * BBR_BW_BUCKET_S;
+        }
+        recompute_max_bw();
+    }
+
+    void record_bandwidth_sample(int64_t wire_sample, double now) {
+        rotate_bw_buckets(now);
+        if (wire_sample > bw_buckets[bw_bucket_idx])
+            bw_buckets[bw_bucket_idx] = wire_sample;
+        if (wire_sample > max_wire_bw) max_wire_bw = wire_sample;
+    }
+
+    void enter_state(bbr_state_t next, double now) {
+        state = next;
+        state_started_s = now;
+        if (next == BBR_PROBE_BW) {
+            cycle_idx = 0;
+            probe_cycle_started_s = now;
+        }
+    }
+
+    void advance_startup(int64_t wire_sample, double now) {
+        if (startup_round_started_s <= 0) {
+            startup_round_started_s = now;
+            startup_round_bw = wire_sample;
+            return;
+        }
+        if (wire_sample > startup_round_bw) startup_round_bw = wire_sample;
+        double round = control_round_s();
+        if (now - startup_round_started_s < round) return;
+
+        if (full_bw == 0 || startup_round_bw > full_bw * 5 / 4) {
+            full_bw = startup_round_bw;
+            full_bw_rounds = 0;
+        } else {
+            ++full_bw_rounds;
+        }
+
+        bool rtt_inflated = min_rtt_s < 1e8 && smoothed_rtt_s > min_rtt_s * 1.50;
+        if (full_bw_rounds >= 3 || (rtt_inflated && full_bw_rounds >= 1))
+            enter_state(BBR_DRAIN, now);
+
+        startup_round_started_s = now;
+        startup_round_bw = 0;
+    }
+
+    void advance_periodic_state(double now) {
+        if (!feedback_ready) return;
+
+        double round = control_round_s();
+        if (state == BBR_DRAIN) {
+            if (bytes_in_flight <= bdp() || now - state_started_s >= round * 2.0)
+                enter_state(BBR_PROBE_BW, now);
+        } else if (state == BBR_PROBE_BW) {
+            if (now - probe_cycle_started_s >= round) {
+                int steps = (int)((now - probe_cycle_started_s) / round);
+                if (steps < 1) steps = 1;
+                cycle_idx = (cycle_idx + steps) % 8;
+                probe_cycle_started_s += (double)steps * round;
+            }
+        }
+
+        if (state != BBR_STARTUP && state != BBR_PROBE_RTT &&
+            min_rtt_s < 1e8 && now - last_probe_rtt > 10.0) {
+            enter_state(BBR_PROBE_RTT, now);
+            last_probe_rtt = now;
+        } else if (state == BBR_PROBE_RTT && now - state_started_s > 0.20) {
+            enter_state(BBR_PROBE_BW, now);
+        }
+    }
+
     void maybe_fail_open(double now) {
         if (!feedback_ready || last_feedback_s <= 0) return;
         double stale_after = 0.75;
@@ -234,16 +341,22 @@ private:
 
         feedback_ready = false;
         feedback_samples = 0;
+        bootstrap_started_s = 0;
         next_send_s = now;
         pacing_rate = 0;
         bytes_in_flight = 0;
         state = BBR_STARTUP;
         cycle_idx = 0;
-        plateau_samples = 0;
-        last_growth_bw = 0;
+        full_bw_rounds = 0;
+        full_bw = 0;
+        startup_round_bw = 0;
+        startup_round_started_s = 0;
+        state_started_s = now;
+        probe_cycle_started_s = now;
         max_wire_bw = 0;
-        bw_sample_idx = 0;
-        std::memset(bw_samples, 0, sizeof(bw_samples));
+        bw_bucket_idx = 0;
+        bw_bucket_started_s = 0;
+        std::memset(bw_buckets, 0, sizeof(bw_buckets));
         congestion_scale = 1.0;
     }
 

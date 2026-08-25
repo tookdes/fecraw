@@ -85,6 +85,65 @@ static void test_fragment_reassembly_with_loss() {
     assert(rx.recovered_symbols() >= 1);
 }
 
+static void test_tail_protection_recovers_final_source() {
+    window_rlnc_sender_t tx;
+    window_rlnc_receiver_t rx;
+    tx.init(64, 1250, 20, 0);
+    tx.set_repair_rate(0.0);
+    rx.init();
+
+    loss_snapshot_t s;
+    s.floor_trusted = true;
+    s.floor = 0.03;
+    s.loss = 0.03;
+    s.burst_factor = 1.0;
+    s.memoryless = true;
+    s.decided = 1000;
+
+    std::vector<std::vector<char> > received;
+    for (int id = 0; id < 4; ++id) {
+        char payload[64];
+        int n = std::snprintf(payload, sizeof(payload), "tail-%d", id);
+        assert(n > 0);
+        std::vector<std::vector<char> > frames;
+        assert(tx.encode_packet(payload, n + 1, frames) == 0);
+        for (size_t i = 0; i < frames.size(); ++i) {
+            if (id == 3 && window_rlnc_sender_t::is_source_frame(
+                               frames[i].data(), (int)frames[i].size()))
+                continue;
+            deliver(rx, frames[i], received);
+        }
+    }
+
+    assert(tx.pending_burst_symbols() == 4);
+    int want = adaptive_fec_t::recommend_tail_repairs(
+        tx.pending_burst_symbols(), s, 0.20);
+    assert(want == 2);
+
+    std::vector<std::vector<char> > tail;
+    int added = tx.protect_burst(want, tail);
+    assert(added == 2);
+    assert(tx.pending_burst_symbols() == 0);
+    for (size_t i = 0; i < tail.size(); ++i)
+        deliver(rx, tail[i], received);
+
+    bool saw_final = false;
+    for (size_t i = 0; i < received.size(); ++i)
+        if (std::strcmp(received[i].data(), "tail-3") == 0) saw_final = true;
+    assert(saw_final);
+    assert(rx.recovered_symbols() >= 1);
+
+    loss_snapshot_t bursty = s;
+    bursty.burst_factor = 2.0;
+    int memoryless = adaptive_fec_t::recommend_tail_repairs(8, s, 0.20);
+    int correlated = adaptive_fec_t::recommend_tail_repairs(8, bursty, 0.20);
+    assert(memoryless == 2);
+    assert(correlated >= memoryless);
+
+    std::printf("tail-protect: floor=0.030 k=4 want=%d; burst2 k=8 want=%d\n",
+                want, correlated);
+}
+
 static bool drop_wire(unsigned seq) {
     unsigned x = seq * 2654435761u + 0x9e3779b9u;
     x ^= x >> 15;
@@ -165,7 +224,8 @@ static void test_window_rate_on_real_link_floor() {
 int main() {
     test_single_symbol_recovery();
     test_fragment_reassembly_with_loss();
+    test_tail_protection_recovers_final_source();
     test_window_rate_on_real_link_floor();
-    std::printf("window-rlnc: source recovery + fragmented packet recovery + WindowRate OK\n");
+    std::printf("window-rlnc: source recovery + fragmented packet recovery + WindowRate + tail protection OK\n");
     return 0;
 }

@@ -37,12 +37,22 @@ public:
     int encode_packet(const char *packet, int len,
                       std::vector<std::vector<char> > &frames);
 
+    // Top the currently unfinished source burst up to desired_total_repairs.
+    // Extra repairs cover exactly the trailing burst, not the whole retained
+    // window. The wire format is unchanged: only the existing repair count/
+    // first-ESI fields differ. On success the burst and fractional credit are
+    // sealed exactly like Queqiao's protectBurst drain point.
+    int protect_burst(int desired_total_repairs,
+                      std::vector<std::vector<char> > &frames);
+
     int window_size() const { return capacity_; }
     int data_shards() const { return data_shards_; }
     int parity_shards() const { return parity_shards_; }
     double repair_rate() const {
         return data_shards_ > 0 ? (double)parity_shards_ / (double)data_shards_ : 0;
     }
+    int pending_burst_symbols() const { return burst_symbols_; }
+    int pending_burst_repairs() const { return burst_repairs_; }
 
     static bool is_frame(const char *data, int len);
     static bool is_source_frame(const char *data, int len);
@@ -65,10 +75,12 @@ private:
     uint32_t next_packet_id_;
     int held_;
     double repair_credit_;
+    int burst_symbols_;
+    int burst_repairs_;
     std::vector<source_slot_t> ring_;
 
     uint32_t add_source(const std::vector<unsigned char> &vector);
-    bool build_repair(std::vector<char> &frame);
+    bool build_repair(std::vector<char> &frame, int count_limit = 0);
 };
 
 class window_rlnc_receiver_t {

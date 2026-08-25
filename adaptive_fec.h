@@ -8,6 +8,8 @@
  * - recommend() sizes a sealed RS block.
  * - recommend_window_rate() sizes continuous repairs/source for RLNC using
  *   Queqiao's empirically calibrated window-chaining model.
+ * - recommend_tail_repairs() sizes the last short burst as a real block so
+ *   the final source symbols do not depend on future traffic for protection.
  */
 
 #include "telemetry.h"
@@ -84,6 +86,20 @@ struct adaptive_fec_t {
         return total > 1.0 ? 1.0 : total;
     }
 
+    static double burst_residual(int data, int total, double loss,
+                                 double burst_factor) {
+        if (data <= 0 || total < data) return 1.0;
+        if (!(loss >= 0.0) || !(loss < 1.0)) return 1.0;
+        if (burst_factor < 1.0 || !std::isfinite(burst_factor))
+            burst_factor = 1.0;
+
+        int trials = (int)std::floor((double)total / burst_factor + 0.5);
+        int need = (int)std::ceil((double)data / burst_factor);
+        if (trials < 1) trials = 1;
+        if (need > trials) return 1.0;
+        return binomial_tail_below(trials, 1.0 - loss, need);
+    }
+
     int recommend(const loss_snapshot_t &s, double rtt_s) const {
         if (!s.floor_trusted) return base_parity;
         double loss = s.floor;
@@ -131,6 +147,31 @@ struct adaptive_fec_t {
                 lo = mid + 1;
         }
         return (double)(lo - effective) / (double)effective;
+    }
+
+    // Queqiao's protectBurst asks the block-code question for the actual tail
+    // length, not the steady-state WindowRate question. Return the TOTAL number
+    // of repairs the short burst should have. -1 means the loss model is not
+    // trusted enough to protect a tail yet; callers should leave it pending.
+    static int recommend_tail_repairs(int data_symbols,
+                                      const loss_snapshot_t &s,
+                                      double rtt_s) {
+        if (data_symbols < 1 || data_symbols > 256) return -1;
+        if (!s.floor_trusted || s.decided < 100) return -1;
+
+        double loss = s.floor;
+        if (loss <= 0) loss = s.loss;
+        if (loss < 0.005) return 0;
+        if (!(loss < 1.0) || !std::isfinite(loss)) return -1;
+
+        double burst = s.burst_factor;
+        if (burst < 1.0 || !std::isfinite(burst)) burst = 1.0;
+        double target = target_residual_for_rtt(rtt_s);
+        for (int total = data_symbols; total <= 256; ++total) {
+            if (burst_residual(data_symbols, total, loss, burst) <= target)
+                return total - data_symbols;
+        }
+        return -1;
     }
 
     bool adjust(const loss_snapshot_t &s, double rtt_s,
