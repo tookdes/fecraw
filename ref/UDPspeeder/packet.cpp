@@ -10,6 +10,8 @@
 #include "packet.h"
 #include "misc.h"
 #include "crc32/Crc32.h"
+#include "telemetry.h"
+#include "pacing.h"
 
 int iv_min = 4;
 int iv_max = 32;  //< 256;
@@ -27,8 +29,6 @@ int disable_xor = 0;
 int random_drop = 0;
 
 char key_string[1000] = "";
-
-// int local_listen_fd=-1;
 
 void encrypt_0(char *input, int &len, char *key) {
     int i, j;
@@ -48,10 +48,6 @@ void decrypt_0(char *input, int &len, char *key) {
     }
 }
 int do_obscure_old(const char *input, int in_len, char *output, int &out_len) {
-    // memcpy(output,input,in_len);
-    //	out_len=in_len;
-    // return 0;
-
     int i, j, k;
     if (in_len > 65535 || in_len < 0)
         return -1;
@@ -106,10 +102,6 @@ int de_obscure(char *data, int &len) {
     return 0;
 }
 int de_obscure_old(const char *input, int in_len, char *output, int &out_len) {
-    // memcpy(output,input,in_len);
-    // out_len=in_len;
-    // return 0;
-
     int i, j, k;
     if (in_len > 65535 || in_len < 0) {
         mylog(log_debug, "in_len > 65535||in_len<0 ,  %d", in_len);
@@ -130,105 +122,110 @@ int de_obscure_old(const char *input, int in_len, char *output, int &out_len) {
     return 0;
 }
 
-/*
-int sendto_fd_ip_port (int fd,u32_t ip,int port,char * buf, int len,int flags)
-{
-
-        sockaddr_in tmp_sockaddr;
-
-        memset(&tmp_sockaddr,0,sizeof(tmp_sockaddr));
-        tmp_sockaddr.sin_family = AF_INET;
-        tmp_sockaddr.sin_addr.s_addr = ip;
-        tmp_sockaddr.sin_port = htons(uint16_t(port));
-
-        return sendto(fd, buf,
-                        len , 0,
-                        (struct sockaddr *) &tmp_sockaddr,
-                        sizeof(tmp_sockaddr));
-}*/
-
 int sendto_fd_addr(int fd, address_t addr, char *buf, int len, int flags) {
     return sendto(fd, buf,
                   len, 0,
                   (struct sockaddr *)&addr.inner,
                   addr.get_len());
 }
-/*
-int sendto_ip_port (u32_t ip,int port,char * buf, int len,int flags)
-{
-        return sendto_fd_ip_port(local_listen_fd,ip,port,buf,len,flags);
-}*/
 
 int send_fd(int fd, char *buf, int len, int flags) {
     return send(fd, buf, len, flags);
 }
 
+static bool is_telemetry_ack_frame(const char *data, int len) {
+    return len == telemetry_link_t::kAckFrame &&
+           (unsigned char)data[0] == 0xF3 &&
+           (unsigned char)data[1] == 0xEC &&
+           (unsigned char)data[2] == 2 &&
+           (unsigned char)data[3] == 2;
+}
+
 int my_send(const dest_t &dest, char *data, int len) {
-    if (dest.cook) {
-        do_cook(data, len);
+    char wire_buf[buf_len];
+    char *send_data = data;
+    int send_len = len;
+    uint64_t telemetry_seq = 0;
+    bool telemetry_data = false;
+    bool telemetry_ack = false;
+
+    if (dest.cook && g_fecraw_telemetry.enabled()) {
+        telemetry_ack = is_telemetry_ack_frame(data, len);
+        if (!telemetry_ack) {
+            int wrapped = g_fecraw_telemetry.prepare_data(
+                data, len, wire_buf, (int)sizeof(wire_buf), telemetry_seq);
+            if (wrapped < 0) {
+                mylog(log_warn, "telemetry frame overflow, packet dropped len=%d\n", len);
+                return -1;
+            }
+            send_data = wire_buf;
+            send_len = wrapped;
+            telemetry_data = true;
+        }
     }
+
+    if (dest.cook)
+        do_cook(send_data, send_len);
+
+    // ACK feedback is control traffic and deliberately bypasses the data pacer.
+    // Data pacing is queued instead of sleeping this libev thread. The queued
+    // packet is already telemetry-framed and cooked, so cook=0 prevents the
+    // second my_send() from framing or pacing it again when its timer fires.
+    bool pacing_reserved = false;
+    if (telemetry_data && g_fecraw_pacing.enabled) {
+        uint64_t pace_delay = g_fecraw_pacing.reserve_delay_us(send_len);
+        pacing_reserved = true;
+        if (pace_delay > 0) {
+            dest_t paced_dest = dest;
+            paced_dest.cook = 0;
+            int queued = delay_manager.add((my_time_t)pace_delay, paced_dest, send_data, send_len);
+            if (queued == 0) {
+                g_fecraw_telemetry.commit_sent(
+                    telemetry_seq, send_len, (double)pace_delay / 1e6);
+                return 0;
+            }
+            g_fecraw_pacing.cancel_reserved(send_len);
+            return -1;
+        }
+    }
+
+    int ret = -1;
     switch (dest.type) {
         case type_fd_addr: {
-            return sendto_fd_addr(dest.inner.fd, dest.inner.fd_addr.addr, data, len, 0);
+            ret = sendto_fd_addr(dest.inner.fd, dest.inner.fd_addr.addr, send_data, send_len, 0);
             break;
         }
         case type_fd64_addr: {
-            if (!fd_manager.exist(dest.inner.fd64)) return -1;
-            int fd = fd_manager.to_fd(dest.inner.fd64);
-
-            return sendto_fd_addr(fd, dest.inner.fd64_addr.addr, data, len, 0);
+            if (fd_manager.exist(dest.inner.fd64)) {
+                int fd = fd_manager.to_fd(dest.inner.fd64);
+                ret = sendto_fd_addr(fd, dest.inner.fd64_addr.addr, send_data, send_len, 0);
+            }
             break;
         }
         case type_fd: {
-            return send_fd(dest.inner.fd, data, len, 0);
+            ret = send_fd(dest.inner.fd, send_data, send_len, 0);
             break;
         }
         case type_write_fd: {
-            return write(dest.inner.fd, data, len);
+            ret = write(dest.inner.fd, send_data, send_len);
             break;
         }
         case type_fd64: {
-            if (!fd_manager.exist(dest.inner.fd64)) return -1;
-            int fd = fd_manager.to_fd(dest.inner.fd64);
-
-            return send_fd(fd, data, len, 0);
+            if (fd_manager.exist(dest.inner.fd64)) {
+                int fd = fd_manager.to_fd(dest.inner.fd64);
+                ret = send_fd(fd, send_data, send_len, 0);
+            }
             break;
         }
-        /*
-        case type_fd64_ip_port_conv:
-        {
-                if(!fd_manager.exist(dest.inner.fd64)) return -1;
-                int fd=fd_manager.to_fd(dest.inner.fd64);
-
-                char *new_data;
-                int new_len;
-
-                put_conv(dest.conv,data,len,new_data,new_len);
-                return sendto_fd_ip_port(fd,dest.inner.fd64_ip_port.ip_port.ip,dest.inner.fd64_ip_port.ip_port.port,new_data,new_len,0);
-                break;
-        }*/
-
-        /*
-        case type_fd64_conv:
-        {
-                char *new_data;
-                int new_len;
-                put_conv(dest.conv,data,len,new_data,new_len);
-
-                if(!fd_manager.exist(dest.inner.fd64)) return -1;
-                int fd=fd_manager.to_fd(dest.inner.fd64);
-                return send_fd(fd,new_data,new_len,0);
-        }*/
-        /*
-        case type_fd:
-        {
-                send_fd(dest.inner.fd,data,len,0);
-                break;
-        }*/
         default:
             assert(0 == 1);
     }
-    return 0;
+
+    if (telemetry_data && ret >= 0)
+        g_fecraw_telemetry.commit_sent(telemetry_seq, send_len);
+    else if (pacing_reserved && ret < 0)
+        g_fecraw_pacing.cancel_reserved(send_len);
+    return ret;
 }
 
 int put_conv0(u32_t conv, const char *input, int len_in, char *&output, int &len_out) {
@@ -267,7 +264,6 @@ int get_conv0(u32_t &conv, const char *input, int len_in, char *&output, int &le
 int put_crc32(char *s, int &len) {
     if (disable_checksum) return 0;
     assert(len >= 0);
-    // if(len<0) return -1;
     u32_t crc32 = (u32_t)crc32_fast(s, len);
     write_u32(s + len, crc32);
     len += sizeof(u32_t);
@@ -308,12 +304,7 @@ int rm_crc32(char *s, int &len) {
     if (crc32 != crc32_in) return -1;
     return 0;
 }
-/*
-int do_obs()
-{
 
-}
-int de_obs()*/
 int put_conv(u32_t conv, const char *input, int len_in, char *&output, int &len_out) {
     static char buf[buf_len];
     output = buf;

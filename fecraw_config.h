@@ -10,6 +10,19 @@
 #include <cstdio>
 #include <cctype>
 
+enum fecraw_codec_t {
+    FECRAW_CODEC_RS = 0,
+    FECRAW_CODEC_RLNC = 1,
+    FECRAW_CODEC_AUTO = 2
+};
+
+static inline const char *fecraw_codec_name(int codec) {
+    if (codec == FECRAW_CODEC_RS) return "rs";
+    if (codec == FECRAW_CODEC_RLNC) return "rlnc";
+    if (codec == FECRAW_CODEC_AUTO) return "auto";
+    return "unknown";
+}
+
 struct fecraw_config_t {
     // general
     int is_server;          // 0=client 1=server
@@ -33,12 +46,14 @@ struct fecraw_config_t {
     int manual_set_tun;
 
     // fec
-    int fec_mode;           // 0=blob, 1=per-packet
-    char fec_str[64];       // e.g. "20:10"
+    int fec_mode;           // UDPspeeder RS mode: 0=blob, 1=per-packet
+    char fec_str[64];       // base redundancy, e.g. "20:10"
     int fec_timeout;        // ms
     int fec_mtu;
     int disable_fec;
-    int fec_adaptive;       // 1=enable adaptive FEC ratio
+    int fec_adaptive;       // 1=enable erasure-aware redundancy planner
+    int fec_codec;          // fecraw_codec_t: rs / rlnc / auto
+    int rlnc_window;        // source symbols retained by sliding-window RLNC
     int small_packet_threshold; // bytes; packets below bypass FEC (0=disabled)
     int small_packet_redundancy; // base redundancy for small packets
 
@@ -52,7 +67,7 @@ struct fecraw_config_t {
     int socket_buf_size;
     int hb_mode;
     int hb_len;
-    int enable_pacing;      // 1=enable BBR pacing
+    int enable_pacing;      // 1=enable erasure-aware pacing
     long long max_bandwidth; // bytes/s hard cap (0=unlimited)
 
     fecraw_config_t() {
@@ -79,6 +94,8 @@ struct fecraw_config_t {
         fec_mtu = 1250;
         disable_fec = 0;
         fec_adaptive = 0;
+        fec_codec = FECRAW_CODEC_RS;
+        rlnc_window = 64;
         small_packet_threshold = 0;
         small_packet_redundancy = 2;
 
@@ -133,9 +150,8 @@ static inline std::string strip_inline_comment(const std::string &s) {
 }
 
 static inline std::string to_lower_ascii(std::string s) {
-    for (size_t i = 0; i < s.size(); ++i) {
+    for (size_t i = 0; i < s.size(); ++i)
         s[i] = (char)std::tolower((unsigned char)s[i]);
-    }
     return s;
 }
 
@@ -150,6 +166,15 @@ static inline int parse_bool_like(const std::string &raw, int &out) {
         return 0;
     }
     return -1;
+}
+
+static inline int parse_fec_codec(const std::string &raw, int &out) {
+    std::string v = to_lower_ascii(trim_ws(raw));
+    if (v == "rs") out = FECRAW_CODEC_RS;
+    else if (v == "rlnc" || v == "window-rlnc" || v == "window_rlnc") out = FECRAW_CODEC_RLNC;
+    else if (v == "auto") out = FECRAW_CODEC_AUTO;
+    else return -1;
+    return 0;
 }
 
 static int parse_toml_config(const char *path, fecraw_config_t &cfg) {
@@ -233,6 +258,13 @@ static int parse_toml_config(const char *path, fecraw_config_t &cfg) {
             else if (key == "fec") strncpy(cfg.fec_str, val.c_str(), sizeof(cfg.fec_str) - 1);
             else if (key == "timeout") cfg.fec_timeout = atoi(val.c_str());
             else if (key == "mtu") cfg.fec_mtu = atoi(val.c_str());
+            else if (key == "codec") {
+                if (parse_fec_codec(val, cfg.fec_codec) != 0) {
+                    fprintf(stderr, "Invalid FEC codec: %s (expected rs/rlnc/auto)\n", val.c_str());
+                    return -1;
+                }
+            }
+            else if (key == "rlnc_window") cfg.rlnc_window = atoi(val.c_str());
             else if (key == "adaptive") {
                 int b = 0;
                 if (parse_bool_like(val, b) == 0) cfg.fec_adaptive = b;
@@ -260,6 +292,9 @@ static int parse_toml_config(const char *path, fecraw_config_t &cfg) {
             else if (key == "max_bandwidth") cfg.max_bandwidth = atoll(val.c_str());
         }
     }
+
+    if (cfg.rlnc_window < 4) cfg.rlnc_window = 4;
+    if (cfg.rlnc_window > 256) cfg.rlnc_window = 256;
     return 0;
 }
 
@@ -285,11 +320,13 @@ static void generate_default_config(const char *path, int is_server) {
     fprintf(f, "tun_dev = \"tun0\"\n");
     fprintf(f, "tun_mtu = 1380\n\n");
     fprintf(f, "[fec]\n");
+    fprintf(f, "codec = \"rs\"                # rs, rlnc, auto\n");
     fprintf(f, "mode = 0\n");
-    fprintf(f, "fec = \"20:10\"\n");
+    fprintf(f, "fec = \"20:10\"               # base data:repair ratio for both codecs\n");
     fprintf(f, "timeout = 8\n");
     fprintf(f, "mtu = 1250\n");
-    fprintf(f, "adaptive = false             # auto-adjust FEC ratio based on loss\n");
+    fprintf(f, "rlnc_window = 64              # 4..256 source symbols\n");
+    fprintf(f, "adaptive = false             # Queqiao-style erasure-aware redundancy\n");
     fprintf(f, "small_packet_threshold = 0   # bytes; 0=disabled, 256=recommended for SSH/gaming\n");
     fprintf(f, "small_packet_redundancy = 2  # base redundancy for small packets\n\n");
     fprintf(f, "[advanced]\n");
@@ -297,8 +334,8 @@ static void generate_default_config(const char *path, int is_server) {
     fprintf(f, "auto_iptables = true\n");
     fprintf(f, "keep_reconnect = true\n");
     fprintf(f, "log_level = 4\n");
-    fprintf(f, "enable_pacing = false        # BBR-lite traffic shaping\n");
-    fprintf(f, "max_bandwidth = 0            # bytes/s hard cap, 0=unlimited\n");
+    fprintf(f, "enable_pacing = false        # erasure-aware BBR-lite traffic shaping\n");
+    fprintf(f, "max_bandwidth = 0            # bytes/s hard cap after pacing bootstrap\n");
     fclose(f);
 }
 

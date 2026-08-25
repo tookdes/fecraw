@@ -76,14 +76,16 @@ static void print_usage() {
     printf("  --subnet <ip>             VPN subnet, default: 10.22.22.0\n");
     printf("  --tun-dev <name>          TUN device name\n");
     printf("  --tun-mtu <n>             TUN MTU, default: 1380\n");
-    printf("  --fec <x:y>              FEC ratio, default: 20:10\n");
-    printf("  --fec-timeout <ms>        FEC timeout, default: 8\n");
+    printf("  --fec <x:y>               Base data:repair ratio, default: 20:10\n");
+    printf("  --fec-codec <mode>        rs(default), rlnc, auto\n");
+    printf("  --rlnc-window <n>         RLNC source window 4..256, default: 64\n");
+    printf("  --fec-timeout <ms>        RS FEC timeout, default: 8\n");
     printf("  --seq-mode <n>            TCP seq mode 0-4, default: 3\n");
     printf("  --auto-rule               Auto add iptables rules\n");
     printf("  --log-level <n>           0=never .. 5=debug\n");
-    printf("  --adaptive-fec            Enable adaptive FEC ratio\n");
+    printf("  --adaptive-fec            Enable erasure-aware redundancy\n");
     printf("  --small-pkt <n>           Small packet threshold (bytes), 0=off\n");
-    printf("  --enable-pacing           Enable BBR-lite traffic shaping\n");
+    printf("  --enable-pacing           Enable erasure-aware BBR-lite pacing\n");
     printf("  --max-bandwidth <n>       Pacing bandwidth cap (bytes/s), 0=unlimited\n");
     printf("  -h, --help                Print this help\n");
 }
@@ -196,6 +198,8 @@ static int parse_cli(int argc, char *argv[], fecraw_config_t &cfg) {
         {"small-pkt",         required_argument, 0, 14},
         {"enable-pacing",     no_argument,       0, 15},
         {"max-bandwidth",     required_argument, 0, 16},
+        {"fec-codec",         required_argument, 0, 17},
+        {"rlnc-window",       required_argument, 0, 18},
         {"help",              no_argument,       0, 'h'},
         {NULL, 0, 0, 0}
     };
@@ -274,6 +278,20 @@ static int parse_cli(int argc, char *argv[], fecraw_config_t &cfg) {
             case 14: cfg.small_packet_threshold = atoi(optarg); break;
             case 15: cfg.enable_pacing = 1; break;
             case 16: cfg.max_bandwidth = atoll(optarg); break;
+            case 17: {
+                int codec = FECRAW_CODEC_RS;
+                if (parse_fec_codec(optarg, codec) != 0) {
+                    fprintf(stderr, "Invalid --fec-codec: %s (expected rs/rlnc/auto)\n", optarg);
+                    return -1;
+                }
+                cfg.fec_codec = codec;
+                break;
+            }
+            case 18:
+                cfg.rlnc_window = atoi(optarg);
+                if (cfg.rlnc_window < 4) cfg.rlnc_window = 4;
+                if (cfg.rlnc_window > 256) cfg.rlnc_window = 256;
+                break;
             case 'h': print_usage(); exit(0);
             default: print_usage(); exit(1);
         }
@@ -348,10 +366,10 @@ int main(int argc, char *argv[]) {
     }
 
     mylog(log_info, "fecraw starting in %s mode\n", g_cfg.is_server ? "server" : "client");
-    mylog(log_info, "raw_mode=%s cipher=%s fec=%s adaptive=%d pacing=%d small_pkt=%d\n",
+    mylog(log_info, "raw_mode=%s cipher=%s fec=%s codec=%s window=%d adaptive=%d pacing=%d small_pkt=%d\n",
           raw_api_mode_name(g_cfg.raw_mode), cipher_mode_name(g_cfg.cipher_mode),
-          g_cfg.fec_str, g_cfg.fec_adaptive, g_cfg.enable_pacing,
-          g_cfg.small_packet_threshold);
+          g_cfg.fec_str, fecraw_codec_name(g_cfg.fec_codec), g_cfg.rlnc_window,
+          g_cfg.fec_adaptive, g_cfg.enable_pacing, g_cfg.small_packet_threshold);
 
     sub_net_uint32 = inet_addr(sub_net);
 

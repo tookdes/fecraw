@@ -15,12 +15,12 @@
 #include "packet.h"
 #include "raw_api.h"
 #include "fecraw_config.h"
-#include "adaptive_fec.h"
-#include "small_packet.h"
-#include "pacing.h"
+#include "erasure_runtime.h"
+#include "window_rlnc.h"
 
 #include <pthread.h>
 #include <sys/socket.h>
+#include <vector>
 
 extern fecraw_config_t g_cfg;
 
@@ -29,15 +29,122 @@ static dest_t raw_dest;
 static dest_t tun_dest;
 static int bridge_fec_fd = -1;
 
-static adaptive_fec_t   g_srv_adaptive;
-static small_packet_sender_t   g_srv_sp_send;
+static adaptive_fec_t g_srv_adaptive;
+static small_packet_sender_t g_srv_sp_send;
 static small_packet_receiver_t g_srv_sp_recv;
-static pacing_t          g_srv_pacing;
+static window_rlnc_sender_t g_srv_rlnc_send;
+static window_rlnc_receiver_t g_srv_rlnc_recv;
+static int g_srv_tx_codec = FECRAW_CODEC_RS;
+static double g_srv_rlnc_last_activity_s = 0;
+static const double kSrvRlncTailIdleS = 0.005;
 
 static void *raw_thread_func(void *arg) {
     int fd = *(int *)arg;
     raw_api_server_loop(fd);
     return NULL;
+}
+
+static int choose_tx_codec() {
+    if (g_cfg.disable_fec) return FECRAW_CODEC_RS;
+    if (g_cfg.fec_codec != FECRAW_CODEC_AUTO) return g_cfg.fec_codec;
+
+    loss_snapshot_t s = g_fecraw_telemetry.snapshot();
+    double rtt = g_fecraw_telemetry.smoothed_rtt_s();
+    if (s.floor_trusted && s.floor >= 0.02 && rtt >= 0.060)
+        return FECRAW_CODEC_RLNC;
+    return FECRAW_CODEC_RS;
+}
+
+static void send_rlnc_frames(const std::vector<std::vector<char> > &frames,
+                             char header) {
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (frames[i].size() + 1 >= (size_t)buf_len) {
+            mylog(log_warn, "server RLNC frame too large: %d\n", (int)frames[i].size());
+            continue;
+        }
+        char packet[buf_len];
+        int plen = (int)frames[i].size();
+        memcpy(packet, frames[i].data(), frames[i].size());
+        put_header(header, packet, plen);
+        my_send(raw_dest, packet, plen);
+    }
+}
+
+static void flush_rlnc_tail(char header, bool force = false) {
+    if (!g_cfg.fec_adaptive) return;
+
+    int symbols = g_srv_rlnc_send.pending_burst_symbols();
+    if (symbols <= 0) {
+        g_srv_rlnc_last_activity_s = 0;
+        return;
+    }
+
+    double now = pacing_t::now_s();
+    if (!force && (g_srv_rlnc_last_activity_s <= 0 ||
+                   now - g_srv_rlnc_last_activity_s < kSrvRlncTailIdleS))
+        return;
+
+    loss_snapshot_t s = g_fecraw_telemetry.snapshot();
+    double rtt = g_fecraw_telemetry.smoothed_rtt_s();
+    int want = adaptive_fec_t::recommend_tail_repairs(symbols, s, rtt);
+    if (want < 0) return;
+
+    int have = g_srv_rlnc_send.pending_burst_repairs();
+    std::vector<std::vector<char> > frames;
+    int added = g_srv_rlnc_send.protect_burst(want, frames);
+    if (added < 0) {
+        mylog(log_warn, "server RLNC tail protection failed symbols=%d want=%d\n",
+              symbols, want);
+        return;
+    }
+    send_rlnc_frames(frames, header);
+    g_srv_rlnc_last_activity_s = 0;
+
+    if (added > 0) {
+        static double last_report = 0;
+        if (last_report <= 0 || now - last_report >= 1.0) {
+            last_report = now;
+            mylog(log_info,
+                  "[server] RLNC tail protect symbols=%d have=%d want=%d added=%d floor=%.3f loss=%.3f burst=%.2f rtt=%.1fms\n",
+                  symbols, have, want, added,
+                  s.floor_trusted ? s.floor : 0.0, s.loss, s.burst_factor,
+                  rtt * 1000.0);
+        }
+    }
+}
+
+static void send_rlnc_packet(char *data, int len, char header) {
+    if (g_cfg.fec_adaptive)
+        g_srv_rlnc_send.set_rate(g_srv_adaptive.data_shards,
+                                 g_srv_adaptive.parity_shards);
+
+    std::vector<std::vector<char> > frames;
+    if (g_srv_rlnc_send.encode_packet(data, len, frames) != 0) {
+        mylog(log_warn, "server RLNC encode failed len=%d\n", len);
+        return;
+    }
+    send_rlnc_frames(frames, header);
+    g_srv_rlnc_last_activity_s = pacing_t::now_s();
+}
+
+static void send_data_packet(conn_info_t &conn_info, char *data, int len, char header) {
+    int desired = choose_tx_codec();
+    if (desired != g_srv_tx_codec) {
+        if (g_srv_tx_codec == FECRAW_CODEC_RS) {
+            from_normal_to_fec2(conn_info, raw_dest, 0, 0, header);
+        } else {
+            flush_rlnc_tail(header, true);
+            g_srv_rlnc_send.reset_window();
+            g_srv_rlnc_last_activity_s = 0;
+        }
+        g_srv_tx_codec = desired;
+        mylog(log_info, "[server] tx codec -> %s\n", fecraw_codec_name(g_srv_tx_codec));
+    }
+
+    if (g_srv_tx_codec == FECRAW_CODEC_RLNC)
+        send_rlnc_packet(data, len, header);
+    else
+        from_normal_to_fec2(conn_info, raw_dest, data, len, header);
 }
 
 static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -63,6 +170,10 @@ static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int reve
         return;
     }
 
+    if (!fecraw_process_wire_input(conn_info, raw_dest, data, len,
+                                    g_srv_adaptive, g_srv_sp_send, "server"))
+        return;
+
     char header = 0;
     if (get_header(header, data, len) != 0) {
         mylog(log_warn, "get_header failed\n");
@@ -81,15 +192,27 @@ static void bridge_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int reve
         return;
     }
 
-    if (g_cfg.enable_pacing)
-        g_srv_pacing.on_ack(len, g_srv_pacing.smoothed_rtt_s > 0 ? g_srv_pacing.smoothed_rtt_s : 0.05);
-
     if (g_cfg.small_packet_threshold > 0 && small_packet_receiver_t::is_small_packet(data, len)) {
         char payload[buf_len];
         int plen = g_srv_sp_recv.receive(data, len, payload, sizeof(payload));
         if (plen > 0) {
             int wlen = write(tun_dest.inner.fd, payload, plen);
             (void)wlen;
+        }
+        return;
+    }
+
+    if (window_rlnc_receiver_t::is_frame(data, len)) {
+        std::vector<std::vector<char> > packets;
+        if (g_srv_rlnc_recv.receive(data, len, packets) != 0) {
+            mylog(log_warn, "server RLNC decode failed\n");
+            return;
+        }
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (!packets[i].empty()) {
+                int wlen = write(tun_dest.inner.fd, packets[i].data(), packets[i].size());
+                (void)wlen;
+            }
         }
         return;
     }
@@ -115,26 +238,23 @@ static void tun_fd_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
 
     do_mssfix(data, len);
 
-    if (g_cfg.enable_pacing)
-        g_srv_pacing.wait(len);
-
     if (g_cfg.small_packet_threshold > 0 && len < g_cfg.small_packet_threshold) {
         char frame[buf_len];
         int flen = g_srv_sp_send.build_frame(data, len, frame, sizeof(frame));
         if (flen > 0) {
             int redundancy = g_srv_sp_send.get_redundancy();
-            char cooked[buf_len];
             for (int i = 0; i < redundancy; i++) {
-                int clen = flen;
-                memcpy(cooked, frame, flen);
-                do_cook(cooked, clen);
-                send(bridge_fec_fd, cooked, clen, 0);
+                char packet[buf_len];
+                int plen = flen;
+                memcpy(packet, frame, flen);
+                put_header(header_normal, packet, plen);
+                my_send(raw_dest, packet, plen);
             }
             return;
         }
     }
 
-    from_normal_to_fec2(conn_info, raw_dest, data, len, header_normal);
+    send_data_packet(conn_info, data, len, header_normal);
 }
 
 static void delay_manager_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
@@ -143,41 +263,21 @@ static void delay_manager_cb(struct ev_loop *loop, struct ev_timer *watcher, int
 
 static void fec_encode_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
+    if (g_srv_tx_codec != FECRAW_CODEC_RS) return;
     from_normal_to_fec2(conn_info, raw_dest, 0, 0, header_normal);
 }
-
-static u64_t srv_prev_fec_input = 0;
-static u64_t srv_prev_fec_output = 0;
 
 static void conn_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
     conn_info.stat.report_as_server(conn_info.addr);
     do_keep_alive(raw_dest);
+}
 
-    if (g_cfg.fec_adaptive) {
-        u64_t cur_in  = conn_info.stat.fec_to_normal.input_packet_num;
-        u64_t cur_out = conn_info.stat.fec_to_normal.output_packet_num;
-        u64_t delta_in  = cur_in - srv_prev_fec_input;
-        u64_t delta_out = cur_out - srv_prev_fec_output;
-        srv_prev_fec_input  = cur_in;
-        srv_prev_fec_output = cur_out;
-
-        if (delta_in > 0) {
-            int sent = (int)delta_in;
-            int recovered = (sent > (int)delta_out) ? sent - (int)delta_out : 0;
-            g_srv_adaptive.record_sent(sent);
-            if (recovered > 0)
-                g_srv_adaptive.record_loss(recovered);
-        }
-
-        int d, p;
-        if (g_srv_adaptive.adjust(d, p)) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%d:%d", d, p);
-            conn_info.fec_encode_manager.get_fec_par().rs_from_str(buf);
-            mylog(log_info, "adaptive FEC adjusted to %s\n", buf);
-        }
-    }
+static void feedback_timer_cb(struct ev_loop *loop, struct ev_timer *watcher, int revents) {
+    (void)loop; (void)watcher; (void)revents;
+    if (g_srv_tx_codec == FECRAW_CODEC_RLNC)
+        flush_rlnc_tail(header_normal);
+    fecraw_flush_wire_feedback(raw_dest);
 }
 
 static void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -193,6 +293,33 @@ static void prepare_cb(struct ev_loop *loop, struct ev_prepare *watcher, int rev
 }
 
 int fecraw_server_event_loop() {
+    g_fecraw_telemetry.init(true);
+
+    auto tail = g_fec_par.get_tail();
+    int base_data = (int)tail.x;
+    int base_parity = (int)tail.y;
+    g_srv_rlnc_send.init(g_cfg.rlnc_window, g_cfg.fec_mtu, base_data, base_parity);
+    g_srv_rlnc_recv.init();
+    g_srv_tx_codec = g_cfg.fec_codec == FECRAW_CODEC_RLNC ? FECRAW_CODEC_RLNC : FECRAW_CODEC_RS;
+
+    if (g_cfg.fec_adaptive) {
+        g_srv_adaptive.init(base_data, base_parity);
+        mylog(log_info, "erasure-aware FEC enabled (base %d:%d)\n", base_data, base_parity);
+    }
+    if (g_cfg.small_packet_threshold > 0) {
+        g_srv_sp_send.init(g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
+        g_srv_sp_recv.init();
+        mylog(log_info, "small packet mode: threshold=%d redundancy=%d\n",
+              g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
+    }
+    if (g_cfg.enable_pacing) {
+        g_fecraw_pacing.init(g_cfg.max_bandwidth);
+        mylog(log_info, "erasure-aware pacing enabled (cold-start fail-open, max_bw=%lld)\n",
+              (long long)g_cfg.max_bandwidth);
+    }
+    mylog(log_info, "fecraw wire protocol v2 telemetry enabled, codec=%s rlnc_window=%d\n",
+          fecraw_codec_name(g_cfg.fec_codec), g_cfg.rlnc_window);
+
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
         mylog(log_fatal, "socketpair() failed: %s\n", strerror(errno));
@@ -268,6 +395,11 @@ int fecraw_server_event_loop() {
     ev_timer_set(&conn_info.timer, 0, timer_interval / 1000.0);
     ev_timer_start(loop, &conn_info.timer);
 
+    ev_timer feedback_timer;
+    ev_init(&feedback_timer, feedback_timer_cb);
+    ev_timer_set(&feedback_timer, 0.010, 0.010);
+    ev_timer_start(loop, &feedback_timer);
+
     struct ev_io fifo_watcher;
     if (fifo_file[0] != 0) {
         int fifo_fd = create_fifo(fifo_file);
@@ -278,23 +410,6 @@ int fecraw_server_event_loop() {
     ev_prepare prepare_watcher;
     ev_init(&prepare_watcher, prepare_cb);
     ev_prepare_start(loop, &prepare_watcher);
-
-    if (g_cfg.fec_adaptive) {
-        int d = 20, p = 10;
-        sscanf(g_cfg.fec_str, "%d:%d", &d, &p);
-        g_srv_adaptive.init(d, p);
-        mylog(log_info, "adaptive FEC enabled (base %d:%d)\n", d, p);
-    }
-    if (g_cfg.small_packet_threshold > 0) {
-        g_srv_sp_send.init(g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
-        g_srv_sp_recv.init();
-        mylog(log_info, "small packet mode: threshold=%d redundancy=%d\n",
-              g_cfg.small_packet_threshold, g_cfg.small_packet_redundancy);
-    }
-    if (g_cfg.enable_pacing) {
-        g_srv_pacing.init(g_cfg.max_bandwidth);
-        mylog(log_info, "BBR pacing enabled (max_bw=%lld)\n", (long long)g_cfg.max_bandwidth);
-    }
 
     mylog(log_info, "fecraw server event loop started\n");
     ev_run(loop, 0);

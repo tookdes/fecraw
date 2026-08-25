@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, feat/erasure-aware-fec-v2]
     tags: ['v*']
   pull_request:
     branches: [master, main]
@@ -17,6 +17,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ libssl-dev
+
+      - name: Unit tests
+        run: make test
 
       - name: Build
         run: make
@@ -37,7 +40,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Build in ARM64 container
+      - name: Test and build in ARM64 container
         run: |
           docker run --rm --platform linux/arm64 \
             -v "$(pwd):/workspace" -w /workspace \
@@ -45,6 +48,7 @@ jobs:
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
               apt-get install -y g++ libssl-dev make
+              make test
               make
             '
 
